@@ -636,7 +636,12 @@ impl Spans {
         let clashing: Vec<u64> = match rule {
             Rule::Start => self
                 .by_start
-                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
+                .range(start.saturating_sub(HEAD - 1)..start.saturating_add((end - start).min(HEAD)))
+                .filter(|&(&at, &(old_end, _))| {
+                    // Packed tint palettes may be only 256 bytes apart.
+                    // Only overlap of the actual head blocks means replacement.
+                    at.saturating_add(old_end.saturating_sub(at).min(HEAD)) > start
+                })
                 .map(|(at, _)| *at)
                 .collect(),
             Rule::Overlap | Rule::Never => self.overlapping(start, end),
@@ -5545,6 +5550,21 @@ mod tests {
         // A draw makes a slot of the second texture: it is one of them.
         assert!(spans.note(9, b, b + 0x2c000, false).is_empty());
         assert_eq!(spans.by_slot.get(&9), Some(&b));
+    }
+
+    #[test]
+    fn small_packed_palette_heads_do_not_evict_neighbours() {
+        let mut spans = Spans::default();
+        spans.rule = Rule::Start;
+        let at = 0x10000;
+        assert!(spans.note(1, at, at + 0x100, true).is_empty());
+        assert!(spans.note(2, at + 0x100, at + 0x200, true).is_empty());
+        assert!(spans.note(3, at + 0x200, at + 0x300, true).is_empty());
+        assert!(spans.note(2, at + 0x100, at + 0x200, true).is_empty());
+        assert_eq!(spans.note(4, at + 0x180, at + 0x200, true), [2]);
+        assert_eq!(spans.by_slot.get(&1), Some(&at));
+        assert_eq!(spans.by_slot.get(&3), Some(&(at + 0x200)));
+        assert_eq!(spans.note(5, at + 0x200, at + 0x280, true), [3]);
     }
 
     /// A texture written where another starts replaces it: at the same
