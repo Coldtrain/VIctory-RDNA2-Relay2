@@ -65,3 +65,6 @@ pub(crate) fn take_latest() -> Option<Captured> {
     LATEST.lock().unwrap_or_else(|e| e.into_inner()).take()
         .filter(|input| input.active.load(Ordering::Acquire))
 }
+
+mod native;
+pub(crate) use native::Backend;

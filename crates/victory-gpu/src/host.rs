@@ -6433,7 +6433,7 @@ impl HostList {
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
-    fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+    pub(crate) fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
         let wanted = legal_for(copy.flags(), wanted);
         self.changed_something();
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
@@ -8787,6 +8787,7 @@ pub fn fullscreen_key(hwnd: usize, message: u32, wparam: usize, lparam: isize) -
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
+    fsr: Option<crate::fsr_framegen::Backend>,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -9186,6 +9187,9 @@ impl Host {
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
+            if let Some(fsr) = &mut p.fsr {
+                if !fsr.before_resize(&p.swap_chain) { return None; }
+            }
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
@@ -9380,6 +9384,16 @@ impl Host {
                 ));
                 list.ResourceBarrier(&post);
             }
+            // Record the AMD SDK's FG preparation on our own present list, after
+            // the game's submissions and the display copy, before queue Present.
+            // When not requested, the legacy present path is unchanged.
+            if crate::fsr_framegen::requested() {
+                let captured = crate::fsr_framegen::take_latest();
+                if let Some(fsr) = &mut p.fsr {
+                    fsr.prepare(&self.device, &p.swap_chain, copy, captured,
+                        texture, state_u32, composed, [width, height], format);
+                }
+            }
             copy.close();
             let flown = match slot {
                 Some(i) => {
@@ -9452,9 +9466,11 @@ impl Host {
                 Scaling: DXGI_SCALING_STRETCH,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let (swap_chain, fsr) = match crate::fsr_framegen::Backend::create(&factory, &self.queue, hwnd, &desc) {
+                Some((chain, backend)) => (chain, Some(backend)),
+                None => (factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                    .cast::<IDXGISwapChain3>()?, None),
+            };
             // We handle Alt+Enter at the next safe present, rather than
             // letting DXGI resize the buffers in the title's window callback.
             if let Err(error) = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) {
@@ -9473,6 +9489,7 @@ impl Host {
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
+                fsr,
                 width,
                 height,
                 format,
