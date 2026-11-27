@@ -207,3 +207,7 @@ cargo build --locked --profile diag -p victory --features diagnostics
 ```
 
 This is based on the graphics-settings-only branch, with no experimental FSR framegen code or SDK dependency. No driver settings are silently modified. Fullscreen behavior and AFMF activation require Windows/Radeon testing. Remove -AFMF to return to ordinary presentation (and disable AFMF in the driver profile if desired).
+
+### Fullscreen toggle
+
+Press Alt+Enter while the game window has focus to request DXGI fullscreen or return to windowed mode. The request is applied by the presenter after pending GPU work is settled; the flip-model buffers are resized after a successful mode change, without changing internal render scale. It works with or without the -AFMF launcher switch. Look for `Alt+Enter: display mode changed` and `fullscreen=true/false` in the log. Driver/Windows mode refusals are logged rather than treated as fatal. Windows runtime testing remains required.

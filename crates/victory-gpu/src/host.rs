@@ -8662,8 +8662,28 @@ fn afmf_requested() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_AFMF").is_some_and(|v| v == "1"))
 }
 
+// Window procedures must never wait for the GPU or lock the presenter.
+// Store only the requested window; consume it at a presentation boundary.
+static FULLSCREEN_TOGGLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Recognize Alt+Enter on either the title window or our fallback window.
+/// Ignore key repeat and consume it without entering the system menu.
+pub fn fullscreen_key(hwnd: usize, message: u32, wparam: usize, lparam: isize) -> bool {
+    const RETURN: usize = 0x0d;
+    const ALT: isize = 1 << 29;
+    const REPEAT: isize = 1 << 30;
+    if message != WM_SYSKEYDOWN || wparam != RETURN || lparam & ALT == 0 {
+        return false;
+    }
+    if lparam & REPEAT == 0 {
+        FULLSCREEN_TOGGLE.store(hwnd, Ordering::Release);
+    }
+    true
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
+    fullscreen_resize_pending: bool,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -9060,7 +9080,30 @@ impl Host {
                 }
             }
         }
-        if (p.width, p.height, p.format) != (width, height, format) {
+        // Alt+Enter is queued by the window procedure. Settle outstanding
+        // presents before changing the mode, and resize the flip-model
+        // buffers even when the title's render resolution is unchanged.
+        if FULLSCREEN_TOGGLE.compare_exchange(p.hwnd.0 as usize, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            settle_now(WHY_SYNC);
+            let mut fullscreen = windows::core::BOOL(0);
+            // SAFETY: serialized with our presents; the output pointer is ours.
+            unsafe {
+                match p.swap_chain.GetFullscreenState(Some(&mut fullscreen), None) {
+                    Ok(()) => {
+                        let wanted = !fullscreen.as_bool();
+                        match p.swap_chain.SetFullscreenState(wanted, None::<&IDXGIOutput>) {
+                            Ok(()) => {
+                                p.fullscreen_resize_pending = true;
+                                tracing::info!(fullscreen = wanted, "Alt+Enter: display mode changed");
+                            }
+                            Err(error) => tracing::warn!(%error, "Alt+Enter: display mode change refused"),
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "Alt+Enter: could not query display mode"),
+                }
+            }
+        }
+        if p.fullscreen_resize_pending || (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
@@ -9070,6 +9113,7 @@ impl Host {
             };
             match resized {
                 Ok(()) => {
+                    p.fullscreen_resize_pending = false;
                     if p.format != format {
                         p.composer = None;
                     }
@@ -9331,6 +9375,11 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            // We handle Alt+Enter at the next safe present, rather than
+            // letting DXGI resize the buffers in the title's window callback.
+            if let Err(error) = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) {
+                tracing::warn!(%error, "could not disable DXGI automatic Alt+Enter");
+            }
             // AFMF runs in the Radeon driver after Present. No FSR context,
             // game motion vectors or interpolation DLL belongs here.
             if afmf_requested() {
@@ -9355,6 +9404,7 @@ impl Host {
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
+                fullscreen_resize_pending: false,
                 width,
                 height,
                 format,
@@ -9841,6 +9891,9 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if fullscreen_key(hwnd.0 as usize, message, wparam.0, lparam.0) {
+        return LRESULT(0);
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
