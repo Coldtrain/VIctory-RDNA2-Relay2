@@ -86,6 +86,43 @@ enum Stop {
     Fail(ShaderError),
 }
 
+/// Paired pixel input masks, indexed by semantic and absolute channel.
+pub(super) type KeptOutputs = HashMap<(String, u32), u8>;
+
+thread_local! {
+    static LINKED_OUTPUTS: std::cell::RefCell<Option<KeptOutputs>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Scope the linked signature to this translation, including existing
+/// translation retries. The guard restores it even if lowering unwinds.
+pub(super) fn with_linked_outputs<R>(keep: &KeptOutputs, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<KeptOutputs>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LINKED_OUTPUTS.with(|k| { k.replace(self.0.take()); });
+        }
+    }
+    let _restore = Restore(LINKED_OUTPUTS.with(|k| k.replace(Some(keep.clone()))));
+    f()
+}
+
+// Adapted from Marvisak/VIctory PR #2398. Keep system values and the
+// contiguous channel span actually read by the paired pixel stage.
+fn prune_signature(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
+    elements.retain_mut(|e| {
+        if e.kind != 0 { return true; }
+        if e.row.is_none() { return false; }
+        let used = keep.get(&(e.name.to_ascii_uppercase(), e.index)).copied().unwrap_or(0);
+        let rel = (used >> e.col) & ((1u8 << e.cols) - 1);
+        if rel == 0 { return false; }
+        let first = rel.trailing_zeros() as u8;
+        let last = 7 - rel.leading_zeros() as u8;
+        e.col += first;
+        e.cols = last - first + 1;
+        true
+    });
+}
+
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_counted(parts, counted_in_threads(parts))
 }
@@ -1399,6 +1436,15 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        LINKED_OUTPUTS.with(|keep| {
+            if let Some(keep) = keep.borrow().as_ref() {
+                if x.native.stage == HwStage::Ps {
+                    prune_signature(&mut s.inputs, keep);
+                } else if x.native.stage == HwStage::Ms {
+                    prune_signature(&mut s.outputs, keep);
+                }
+            }
+        });
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -1583,11 +1629,21 @@ impl<'a> Lower<'a> {
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
+            LINKED_OUTPUTS.with(|keep| {
+                if let Some(keep) = keep.borrow().as_ref() {
+                    prune_signature(&mut s.prims, keep);
+                }
+            });
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
+            // Keep the same maxima as the original over-budget standalone
+            // shader even if pruning would let larger maxima fit.
+            let tighten = LINKED_OUTPUTS.with(|keep| keep.borrow().is_some())
+                && super::container::mesh_output_bytes(&x.outputs, &x.prims, ms.max_vertices, ms.max_primitives)
+                    > super::container::MESH_OUTPUT_LIMIT;
             s.mesh = Some(super::shader::Mesh {
-                max_vertices: ms.max_vertices,
-                max_primitives: ms.max_primitives,
+                max_vertices: if tighten { ms.max_vertices.min(ms.threads) } else { ms.max_vertices },
+                max_primitives: if tighten { ms.max_primitives.min(ms.threads) } else { ms.max_primitives },
                 topology: ms.topology,
             });
             // Barriers order the lanes' LDS accesses; the console's
@@ -10589,7 +10645,7 @@ impl<'a> Lower<'a> {
                 .find(|i| i.row == attribute.row && i.fp16)
                 .map(|i| {
                     let packs = if i.pack2 {
-                        input_packs(&self.x.native.io, &self.s.inputs)
+                        input_packs(&self.x.native.io, &self.x.inputs)
                     } else {
                         Vec::new()
                     };
@@ -10618,7 +10674,7 @@ impl<'a> Lower<'a> {
                 // per dword (`packed_half`); the host's are 32-bit floats.
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
                     let src = if pack2 {
-                        packed_half(&l.s.inputs, &packs, attribute.row, h)
+                        packed_half(&l.x.inputs, &packs, attribute.row, h)
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };
@@ -12244,7 +12300,7 @@ impl<'a> Lower<'a> {
                 for high in [false, true] {
                     let h = 2 * ch + u8::from(high);
                     let src = if pack2 {
-                        packed_half(outputs, &packs, row, h)
+                        packed_half(if primitive { &self.x.prims } else { &self.x.outputs }, &packs, row, h)
                     } else {
                         (!high).then_some((row, ch))
                     };
@@ -12487,7 +12543,7 @@ impl<'a> Lower<'a> {
                 .any(|o| o.param & 0x80 == 0 && o.usage != Usage::Other(0) && u32::from(o.row) == r)
         };
         let free: std::collections::BTreeSet<u32> = self
-            .s
+            .x
             .outputs
             .iter()
             .filter(|o| o.kind == 0)

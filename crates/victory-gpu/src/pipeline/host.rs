@@ -452,6 +452,26 @@ impl HostPipeline {
         for (s, _) in &stages {
             s.translated()?;
         }
+        // PR #2398: only mesh pipelines that exceed the D3D12 output
+        // limit need paired translation. All other pipelines are unchanged.
+        let linked = if let Some(ms) = mesh
+            && std::env::var_os("VICTORY_LINK_MESH_OUTPUTS").is_none_or(|v| v != "0")
+            && victory_shader::emit::mesh_output_bytes(&ms.translated()?.host.dxil)
+                .is_some_and(|n| n > victory_shader::emit::MESH_OUTPUT_LIMIT)
+        {
+            let Some(pair) = super::translate_linked(ms, find("pixel").map(Arc::as_ref)) else {
+                return refuse("over-budget mesh shader could not be linked", shaders);
+            };
+            Some(pair)
+        } else { None };
+        let stages = match &linked {
+            Some((ms, ps)) => {
+                let mut v = vec![(ms, D3D12_SHADER_VISIBILITY_MESH)];
+                if let Some(ps) = ps { v.push((ps, D3D12_SHADER_VISIBILITY_PIXEL)); }
+                v
+            }
+            None => stages,
+        };
         let host = host()?;
 
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();

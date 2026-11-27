@@ -116,7 +116,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
 }
 
 /// The most a mesh shader's outputs may take, in bytes (D3D12).
-pub(crate) const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
+pub const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
 
 /// A mesh shader's output size as the DXIL validator measures it against
 /// [`MESH_OUTPUT_LIMIT`]: 4 bytes per component of every vertex element

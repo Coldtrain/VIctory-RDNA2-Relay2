@@ -117,6 +117,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
+pub use container::MESH_OUTPUT_LIMIT;
 pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
@@ -399,6 +400,63 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
         }
         other => other,
     }
+}
+
+/// Mesh output size from an emitted DXIL container, as in PR #2398.
+pub fn mesh_output_bytes(dxil: &[u8]) -> Option<u64> {
+    let c = Container::parse(dxil).ok()?;
+    let psv = c.part(FourCC::PSV0)?.data;
+    if crate::dxbc::u32_at(psv, 0).ok()? < 48 || *psv.get(28)? != 13 { return None; }
+    let at = |n: usize| -> Option<u32> {
+        Some(u32::from(u16::from_le_bytes(psv.get(n..n+2)?.try_into().ok()?)))
+    };
+    let outputs = match c.part(FourCC::OSG1) {
+        Some(p) => signature(p.data).ok()?, None => Vec::new(),
+    };
+    let prims = match c.part(FourCC::PSG1) {
+        Some(p) => signature(p.data).ok()?, None => Vec::new(),
+    };
+    Some(container::mesh_output_bytes(&outputs, &prims, at(16)?, at(18)?))
+}
+
+fn pixel_input_reads(dxil: &[u8]) -> Result<lower::KeptOutputs, ShaderError> {
+    let c = Container::parse(dxil)?;
+    let mut reads = lower::KeptOutputs::new();
+    let Some(part) = c.part(FourCC::ISG1) else { return Ok(reads); };
+    let count = crate::dxbc::u32_at(part.data, 0)? as usize;
+    let base = crate::dxbc::u32_at(part.data, 4)? as usize;
+    for i in 0..count {
+        let at = base + 32 * i;
+        if crate::dxbc::u32_at(part.data, at + 12)? != 0 { continue; }
+        let name_at = crate::dxbc::u32_at(part.data, at + 4)? as usize;
+        let name = part.data.get(name_at..)
+            .and_then(|s| s.split(|&b| b == 0).next())
+            .ok_or(ShaderError::Malformed("signature name out of bounds"))?;
+        let index = crate::dxbc::u32_at(part.data, at + 8)?;
+        let rw = *part.data.get(at + 25).ok_or(ShaderError::Malformed("truncated"))?;
+        if rw != 0 {
+            *reads.entry((String::from_utf8_lossy(name).to_ascii_uppercase(), index)).or_insert(0) |= rw;
+        }
+    }
+    Ok(reads)
+}
+
+/// Link only over-budget meshes to their actual pixel shader. Preserve
+/// original console register packing and every system value.
+pub fn translate_linked(mesh: &[u8], pixel: Option<&[u8]>, pixel_dxil: Option<&[u8]>)
+    -> Result<(HostShader, Option<HostShader>), ShaderError> {
+    let reads = match (pixel, pixel_dxil) {
+        (Some(_), Some(dxil)) => pixel_input_reads(dxil)?,
+        (None, None) => lower::KeptOutputs::new(),
+        _ => return Err(ShaderError::Malformed("missing paired pixel shader")),
+    };
+    let ms = lower::with_linked_outputs(&reads, || translate(mesh))?;
+    let bytes = mesh_output_bytes(&ms.dxil).ok_or(ShaderError::Malformed("linked mesh output declaration missing"))?;
+    if bytes > MESH_OUTPUT_LIMIT {
+        return Err(ShaderError::Unsupported { offset: 0, what: "a linked mesh shader exceeding the 32 KiB output budget" });
+    }
+    let ps = pixel.map(|p| lower::with_linked_outputs(&reads, || translate(p))).transpose()?;
+    Ok((ms, ps))
 }
 
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {

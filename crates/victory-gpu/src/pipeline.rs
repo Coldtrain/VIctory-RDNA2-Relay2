@@ -235,6 +235,57 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     })
 }
 
+/// In-memory linked pair cache. Each pair has its own resource metadata
+/// and PSO code; never overwrite an ordinary standalone shader cache entry.
+#[cfg(windows)]
+pub(crate) fn translate_linked(ms: &Shader, ps: Option<&Shader>)
+    -> Option<(Arc<Shader>, Option<Arc<Shader>>)> {
+    type Pair = (Arc<Shader>, Option<Arc<Shader>>);
+    type Key = ([u8; 32], Option<[u8; 32]>);
+    static LINKED: Mutex<Option<HashMap<Key, Option<Pair>>>> = Mutex::new(None);
+    let key = (*blake3::hash(&ms.container).as_bytes(), ps.map(|p| *blake3::hash(&p.container).as_bytes()));
+    if let Some(hit) = LINKED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key)) {
+        return hit.clone();
+    }
+    let ps_original = match ps { Some(p) => Some(p.translated()?), None => None };
+    let make = |src: &Shader, host: victory_shader::emit::HostShader| -> Option<Arc<Shader>> {
+        let original = src.translated()?;
+        let used = original.used.clone();
+        let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+        let translated = Translated {
+            host, threads: original.threads, used, tables,
+            stores: original.stores, stores_by_address: original.stores_by_address,
+            picks: Default::default(),
+        };
+        let cell = OnceLock::new();
+        let _ = cell.set(Some(translated));
+        Some(Arc::new(Shader { stage: src.stage, hash: src.hash.clone(), container: src.container.clone(),
+            ambient: src.ambient, translated: cell }))
+    };
+    let result = match victory_shader::emit::translate_linked(
+        &ms.container, ps.map(|p| p.container.as_slice()), ps_original.map(|p| p.host.dxil.as_slice())) {
+        Ok((mesh, pixel)) => {
+            let bytes = victory_shader::emit::mesh_output_bytes(&mesh.dxil);
+            let m = make(ms, mesh)?;
+            let p = match (ps, pixel) {
+                (Some(src), Some(host)) => Some(make(src, host)?),
+                (None, None) => None,
+                _ => return None,
+            };
+            tracing::info!(mesh = %ms.hash, pixel = ps.map_or("none", |p| p.hash.as_str()), ?bytes,
+                "mesh and pixel linked under 32 KiB output budget");
+            Some((m, p))
+        }
+        Err(e) => {
+            tracing::warn!(mesh = %ms.hash, pixel = ps.map_or("none", |p| p.hash.as_str()), error = %e,
+                "linked mesh/pixel translation failed");
+            None
+        }
+    };
+    LINKED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key, result.clone());
+    result
+}
+
 /// The compute pipelines of the console's ray-tracing structure builder
 /// (`XboxBvhBuilder.dll`; its programs are the ones with a spilled
 /// user-data table) run **all or none**. Its stages feed each other
