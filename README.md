@@ -89,6 +89,29 @@ DLL entry point. See https://lsfg-vk.dev/ and
 https://github.com/56TR/lsfg-vk-windows for the Vulkan approach.
 No proprietary DLL or shaders are bundled.
 
+### Native FSR 3.1.4 dispatch backend (not wired to the game yet)
+
+The native DLL implements real AMD context creation, configuration without swapchain notification,
+frame preparation, and one generated frame dispatch. It consumes a HUD-free scene, validated
+R32_FLOAT depth and RG float motion textures plus camera data. It performs no CPU readback.
+The caller must keep all resources alive until its queue fence completes, transition resources,
+rebind descriptor heaps and root state after AMD calls, discard the first/reset generated frame,
+and present the interpolation followed by the real frame with original HUD composition.
+
+Build the bridge from x64 Visual Studio Developer PowerShell:
+```powershell
+.\scripts\build-fsr31-native.ps1 -SdkRoot 'C:\SDK\FidelityFX-SDK-1.1.4'
+```
+
+The log from 2026-11-27 02:03 showed repeated 576x324 resources:
+two R32G8X24_TYPELESS depth targets, one R24G8_TYPELESS depth target,
+one R16G16_FLOAT target, one R32G32_FLOAT target. Their first-use indices change.
+These are candidates, not validated semantic inputs. The bridge requires explicitly verified
+depth, motion scale/direction, camera jitter, projection and view transforms. Do not hardcode
+process-local addresses or select a resource by list index. No game wiring, scheduling,
+or framegen environment toggle has been enabled by this commit. The bridge itself has not been
+compiled or executed on Windows.
+
 ### AMD FSR 3.1 frame generation groundwork
 
 This branch inherits the scene-plane preview branch. It adds a standalone
