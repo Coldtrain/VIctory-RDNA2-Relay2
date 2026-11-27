@@ -30,6 +30,7 @@ $settings = @{
 # All cumulative experimental ports remain available through -More.
 $settings.VICTORY_PLANES = '1'
 $settings.VICTORY_PORT_CONSTANTS = '1'
+$settings.VICTORY_PORT_AMD_PROBE_FILTER = '1'
 $settings.VICTORY_PORT_DESCRIPTORS = '0'
 $settings.VICTORY_PORT_CBV = '0'
 $settings.VICTORY_PORT_CBV_PLACE = '0'

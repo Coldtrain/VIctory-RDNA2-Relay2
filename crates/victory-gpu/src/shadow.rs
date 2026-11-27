@@ -5206,10 +5206,16 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         mb.unwrap_or(4096) << 20
     });
-    let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
+    let room = host.video_memory().is_none_or(|[budget, used, ..]| used.saturating_add(len) < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
+    // Reserve only if the request fits. A refused GPU allocation must not
+    // permanently consume the by-address budget (Belobug e9428969).
+    let on_card = if room && reserve_by_address(&USED, len, most) {
+        let made = host.uav_buffer(len);
+        if made.is_none() {
+            USED.fetch_sub(len, Ordering::Relaxed);
+        }
+        made
     } else {
         None
     };
@@ -5237,6 +5243,26 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let shadow = Arc::new(shadow);
     CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     Some(shadow)
+}
+
+/// Reserve against the by-address cap without accounting failed requests.
+fn reserve_by_address(used: &AtomicU64, len: u64, most: u64) -> bool {
+    used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        old.checked_add(len).filter(|&next| next <= most)
+    }).is_ok()
+}
+
+#[cfg(test)]
+#[test]
+fn by_address_reservation_does_not_charge_refused_requests() {
+    let used = AtomicU64::new(6);
+    assert!(!reserve_by_address(&used, 5, 10));
+    assert_eq!(used.load(Ordering::Relaxed), 6);
+    assert!(reserve_by_address(&used, 4, 10));
+    assert_eq!(used.load(Ordering::Relaxed), 10);
+    assert!(!reserve_by_address(&used, u64::MAX, u64::MAX));
+    used.fetch_sub(4, Ordering::Relaxed); // allocation failed
+    assert!(reserve_by_address(&used, 4, 10));
 }
 
 /// Copies of title memory outside buffers, by (start, length).
