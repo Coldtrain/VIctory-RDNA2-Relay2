@@ -4344,14 +4344,10 @@ fn make_twinned(
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
-                // Levels on demand (`crate::tiles`): a texture made level by
-                // level is shown from the first level that is the title's
-                // and has memory, if the title's view starts before it (a
-                // level without memory reads zeros: a black texture). The
-                // title's own view mostly starts there already.
-                if let Some(first) = crate::resource::first_shown(resource)
-                    && first > 0
-                {
+                // Only expose a contiguous run of backed mips, including
+                // the case where mip zero is present but a later mip is not.
+                let resident = crate::resource::shown_levels(resource);
+                if resident != 0 {
                     // SAFETY: a live resource.
                     let own = unsafe { texture.GetDesc() };
                     // The texture's own view (the title gave none): all of it.
@@ -4368,7 +4364,7 @@ fn make_twinned(
                             },
                         },
                     };
-                    crate::tiles::show_from(desc.get_or_insert(whole), first, u32::from(own.MipLevels));
+                    crate::tiles::show_resident(desc.get_or_insert(whole), resident, u32::from(own.MipLevels));
                 }
                 if copy.base > 0
                     && let Some(desc) = &mut desc

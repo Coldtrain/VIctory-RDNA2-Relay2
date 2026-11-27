@@ -333,7 +333,7 @@ impl Tiled {
             packed: packed_tiles,
             levels,
             full,
-            shown: AtomicU32::new(u32::MAX),
+            shown: AtomicU32::new(0),
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
@@ -516,7 +516,6 @@ impl Tiled {
         named: u32,
         may: u32,
     ) -> bool {
-        let has = |level: u32| level < 32 && named & (1 << level) != 0;
         let now = |level: u32| level < 32 && named & may & (1 << level) != 0;
         let first_packed = self.standard.len() as u32;
         // (subresource, tiles, the level if it has tiles of its own) to map now.
@@ -579,23 +578,20 @@ impl Tiled {
             STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
             STATS[5].fetch_add(1, Ordering::Relaxed);
         }
-        let with_tiles = |level: u32| {
-            if level < first_packed {
-                given.levels[level as usize]
-            } else {
-                given.packed
-            }
-        };
-        let shown = (0..self.levels).find(|&level| has(level) && with_tiles(level)).unwrap_or(u32::MAX);
+        let valid = u32::MAX >> (32 - self.levels.clamp(1, 32));
+        let shown = named & !self.without_locked(given, named) & valid;
         self.shown.swap(shown, Ordering::Relaxed) != shown
     }
 
-    /// The first level a view of the texture may show; `None` while no
-    /// level is both held and given (the views are then as the title made
-    /// them, and read zeros).
-    pub(crate) fn first_shown(&self) -> Option<u32> {
-        let shown = self.shown.load(Ordering::Relaxed);
-        (shown != u32::MAX).then_some(shown)
+    /// Mask of held or GPU-written mip levels with backing tiles.
+    pub(crate) fn shown_levels(&self) -> u32 {
+        self.shown.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn first_shown(&self) -> Option<u32> {
+        let shown = self.shown_levels();
+        (shown != 0).then(|| shown.trailing_zeros())
     }
 
     /// Whether level `level` has tiles.
@@ -645,26 +641,39 @@ impl Drop for Tiled {
     }
 }
 
-/// Keeps a two-dimensional shader view (2D or 2D array) from the levels
-/// before `first` of a texture of `levels` levels: it starts at `first` if
-/// it started before it, shows as many levels fewer (clamped to the
-/// remaining levels), and reduces `ResourceMinLODClamp` by the same shift so
-/// the effective minimum LOD stays at the same resource level.
-pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
-    if first >= levels {
+/// Restricts a 2D shader view to the first contiguous resident mip run
+/// within its requested range. If the whole range is absent, use the
+/// nearest coarser resident mip, or the coarsest finer one.
+pub(crate) fn show_resident(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, resident: u32, levels: u32) {
+    let levels = levels.min(32);
+    if levels == 0 || resident == 0 {
         return;
     }
+    let resident = resident & (u32::MAX >> (32 - levels));
     let clamp = |most: &mut u32, mips: &mut u32, min_lod: &mut f32| {
-        if first <= *most {
+        if *most >= levels || *mips == 0 || resident == 0 {
             return;
         }
-        let fewer = first - *most;
-        *most = first;
-        if *mips != u32::MAX {
-            *mips = mips.saturating_sub(fewer).clamp(1, levels - first);
+        let end = most.saturating_add(*mips).min(levels);
+        let requested = end - *most;
+        let coarser = resident >> *most;
+        if coarser == 0 {
+            *most = u32::BITS - 1 - resident.leading_zeros();
+            *mips = 1;
+            *min_lod = 0.0;
+            return;
         }
+        let shift = coarser.trailing_zeros();
+        let first = *most + shift;
+        let available = (coarser >> shift).trailing_ones();
+        let count = if first < end { available.min(end - first) } else { 1 };
+        if shift == 0 && count == requested {
+            return;
+        }
+        *most = first;
+        *mips = count;
         if *min_lod > 0.0 {
-            *min_lod = (*min_lod - fewer as f32).max(0.0);
+            *min_lod = (*min_lod - shift as f32).clamp(0.0, (count - 1) as f32);
         }
     };
     match desc.ViewDimension {
@@ -1318,7 +1327,7 @@ void look() {
                 },
             };
             let mut shown = as_asked;
-            show_from(&mut shown, tiled.first_shown()?, u32::from(LEVELS));
+            show_resident(&mut shown, tiled.shown_levels(), u32::from(LEVELS));
             assert_eq!(shown.Anonymous.Texture2D.MostDetailedMip, 1);
             let step = rig.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let mut at = views.GetCPUDescriptorHandleForHeapStart();
@@ -1411,9 +1420,9 @@ void look() {
         assert_eq!(tiled.first_shown(), Some(0));
         assert_eq!(tiled.claim(1 << 0), 0, "a level with tiles is not claimed again");
         // With room everything held gets its tiles.
-        let (_, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), true);
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), true);
         rig.check("the last upload, with room");
-        assert!(!waiting && tiled.whole());
+        assert!(changed && !waiting && tiled.whole());
         read_as_given(rig, "everything given");
     }
 
@@ -1481,7 +1490,7 @@ void look() {
     }
 
     #[test]
-    fn show_from_clamps_2d_and_2d_array_and_adjusts_min_lod() {
+    fn show_resident_clamps_2d_and_2d_array_and_adjusts_min_lod() {
         let mut srv2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -1495,7 +1504,7 @@ void look() {
                 },
             },
         };
-        show_from(&mut srv2d, 3, 11);
+        show_resident(&mut srv2d, from_level(3), 11);
         // SAFETY: `ViewDimension` is `TEXTURE2D`.
         let v2d = unsafe { srv2d.Anonymous.Texture2D };
         assert_eq!(v2d.MostDetailedMip, 3);
@@ -1518,12 +1527,22 @@ void look() {
                 },
             },
         };
-        show_from(&mut srv_arr, 2, 11);
+        show_resident(&mut srv_arr, from_level(2), 11);
         // SAFETY: `ViewDimension` is `TEXTURE2DARRAY`.
         let varr = unsafe { srv_arr.Anonymous.Texture2DArray };
         assert_eq!(varr.MostDetailedMip, 2);
         assert_eq!(varr.MipLevels, 4);
         assert_eq!(varr.ResourceMinLODClamp, 0.0);
+        // A hole after the finest resident mip must never be sampled.
+        show_resident(&mut srv_arr, (1 << 2) | (1 << 4), 11);
+        let hole = unsafe { srv_arr.Anonymous.Texture2DArray };
+        assert_eq!(hole.MostDetailedMip, 2);
+        assert_eq!(hole.MipLevels, 1);
+        // A request for missing levels falls back to a backed level.
+        show_resident(&mut srv_arr, 1, 11);
+        let fallback = unsafe { srv_arr.Anonymous.Texture2DArray };
+        assert_eq!(fallback.MostDetailedMip, 0);
+        assert_eq!(fallback.MipLevels, 1);
     }
 
     #[test]
@@ -1565,7 +1584,7 @@ void look() {
                 packed: false,
                 runs: Vec::new(),
             }),
-            shown: AtomicU32::new(u32::MAX),
+            shown: AtomicU32::new(0),
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
