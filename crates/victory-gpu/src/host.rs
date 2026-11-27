@@ -2562,7 +2562,20 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{flagged_pieces, join_copy_ranges, join_ranges, landable, touches_other};
+
+    #[test]
+    fn relay_waits_for_aliases_and_readbacks_but_not_the_same_copy() {
+        let mut written = Vec::new();
+        let mut owned = Vec::new();
+        join_ranges(&mut written, [(0x1000, 0x2000), (0x4000, 0x4100)]);
+        join_copy_ranges(&mut owned, [(1, 0x1000, 0x1800), (1, 0x1800, 0x2000), (0, 0x4000, 0x4100)]);
+        assert_eq!(owned, [(0, 0x4000, 0x4100), (1, 0x1000, 0x2000)]);
+        assert!(!touches_other(&written, &owned, 1, 0x1000, 0x2000));
+        assert!(touches_other(&written, &owned, 2, 0x1800, 0x1900));
+        assert!(!touches_other(&written, &owned, 2, 0x2000, 0x3000));
+        assert!(touches_other(&written, &owned, 1, 0x4000, 0x4100));
+    }
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -2676,6 +2689,8 @@ struct Line {
     /// The title memory the flights' shaders and texture readbacks may write
     /// (address, end), in order and joined.
     written: Vec<(usize, usize)>,
+    /// In-flight writes by host-copy owner; zero denotes a title-memory readback.
+    by_copy: Vec<(usize, usize, usize)>,
     /// Host lists in the flights.
     lists: usize,
     /// The value signalled on the host's fence behind the last flight.
@@ -2704,6 +2719,7 @@ unsafe impl Send for Line {}
 static LINE: Mutex<Line> = Mutex::new(Line {
     line: Vec::new(),
     written: Vec::new(),
+    by_copy: Vec::new(),
     lists: 0,
     target: 0,
     settling: false,
@@ -2765,6 +2781,51 @@ fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = 
     *ranges = out;
 }
 
+/// Keep ranges joined per host-copy identity, including owner zero for readbacks.
+fn join_copy_ranges(ranges: &mut Vec<(usize, usize, usize)>, more: impl IntoIterator<Item = (usize, usize, usize)>) {
+    ranges.extend(more.into_iter().filter(|r| r.1 < r.2));
+    ranges.sort_unstable();
+    let mut out: Vec<(usize, usize, usize)> = Vec::with_capacity(ranges.len());
+    for &(owner, from, to) in ranges.iter() {
+        match out.last_mut() {
+            Some(last) if last.0 == owner && from <= last.2 => last.2 = last.2.max(to),
+            _ => out.push((owner, from, to)),
+        }
+    }
+    *ranges = out;
+}
+
+fn touches_other(written: &[(usize, usize)], by_copy: &[(usize, usize, usize)], copy: usize, from: usize, to: usize) -> bool {
+    touches(written, from, to)
+        && by_copy.iter().any(|&(owner, a, b)| owner != copy && a < to && b > from)
+}
+
+fn owned_writes(back: &[Declared]) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+    back.iter().flat_map(|(shadow, ranges)| {
+        let owner = std::sync::Arc::as_ptr(shadow) as usize;
+        ranges.iter().map(move |&(a, b)| (owner, a, b))
+    })
+}
+
+impl Line {
+    /// Keep the landing flight's ranges until its CPU copyback is published.
+    /// Bottom-of-pipe writes also change title memory, independently of any shadow.
+    fn hazards(&self) -> (Vec<(usize, usize)>, Vec<(usize, usize, usize)>) {
+        let mut written = self.written.clone();
+        let mut by_copy = self.by_copy.clone();
+        let immediate: Vec<_> = self.in_hand.iter().map(|&(at, _, n)| (at, at.saturating_add(n)))
+            .chain(self.line.iter().filter_map(|item| match item {
+                Late::Write(at, _, n) => Some((*at, at.saturating_add(*n))),
+                _ => None,
+            })).collect();
+        if !immediate.is_empty() {
+            join_ranges(&mut written, immediate.iter().copied());
+            join_copy_ranges(&mut by_copy, immediate.into_iter().map(|(a, b)| (0, a, b)));
+        }
+        (written, by_copy)
+    }
+}
+
 /// Whether anything is in the air.
 fn flying() -> bool {
     if !late() {
@@ -2781,14 +2842,12 @@ fn flying() -> bool {
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
-    let (written, copies) = {
+    let (written, by_copy, copies) = {
         let line = line();
-        if line.written.is_empty() {
-            return None;
-        }
-        (line.written.clone(), card_steps::copies(&line))
+        let (written, by_copy) = line.hazards();
+        (written, by_copy, card_steps::copies(&line))
     };
-    blocked_by(&written, runs, true).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
+    blocked_by(&written, &by_copy, runs, true).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
 }
 
 /// Whether a small fill of upload memory, or copy of a title buffer, goes on without waiting for
@@ -2959,7 +3018,7 @@ fn copy_blocked(written: &[(usize, usize)], dst: usize, src: usize, len: usize) 
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
-fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+fn blocked_by(written: &[(usize, usize)], by_copy: &[(usize, usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
@@ -3026,7 +3085,17 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 },
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
+                Step::Refresh(shadow, address, len) => {
+                    let owner = std::sync::Arc::as_ptr(shadow) as usize;
+                    if touches_other(written, by_copy, owner, *address, address.saturating_add(*len)) {
+                        if count {
+                            #[cfg(feature = "diagnostics")]
+                            blame("an aliased host copy", written, *address, *len);
+                        }
+                        return Some(WHY_READ);
+                    }
+                }
+                Step::GpuWrite(..) | Step::Host(..) => {}
             }
         }
     }
@@ -3116,15 +3185,21 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
         return false;
     }
     let ahead: Vec<&HostList> = ahead.collect();
-    let mut written: Vec<(usize, usize)> = declared_writes(&ahead).into_iter().flat_map(|(_, ranges)| ranges).collect();
+    let declared = declared_writes(&ahead);
+    let mut owned = Vec::new();
+    join_copy_ranges(&mut owned, owned_writes(&declared));
+    let mut written: Vec<(usize, usize)> = declared.iter().flat_map(|(_, ranges)| ranges.iter().copied()).collect();
+    let mut immediate = Vec::new();
     for list in &ahead {
         let deferred = list.deferred();
-        written.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
-        written.extend(deferred.backs.iter().map(|&(_, at, [row, rows, pitch])| (at, at + rows.saturating_sub(1) * pitch + row)));
+        immediate.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
+        immediate.extend(deferred.backs.iter().map(|&(_, at, [row, rows, pitch])| (at, at + rows.saturating_sub(1) * pitch + row)));
     }
     let mut joined = Vec::new();
+    written.extend(immediate.iter().copied());
     join_ranges(&mut joined, written);
-    blocked_by(&joined, next, false).is_none()
+    join_copy_ranges(&mut owned, immediate.into_iter().map(|(a, b)| (0, a, b)));
+    blocked_by(&joined, &owned, next, false).is_none()
 }
 
 /// Whether a bottom-of-pipe write of `list` meets `wait`.
@@ -4956,6 +5031,7 @@ impl Host {
             let Line {
                 line: items,
                 written,
+                by_copy,
                 lists,
                 settling,
                 poke,
@@ -4969,16 +5045,21 @@ impl Host {
             landing.clear();
             // What is still in the air, from the flights that are.
             written.clear();
+            by_copy.clear();
             *lists = 0;
             let mut ranges = Vec::new();
+            let mut owned = Vec::new();
             for item in items.iter() {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
                     ranges.extend(flight.texture_back_ranges.iter().copied());
+                    owned.extend(owned_writes(&flight.back));
+                    owned.extend(flight.texture_back_ranges.iter().map(|&(a, b)| (0, a, b)));
                 }
             }
             join_ranges(written, ranges);
+            join_copy_ranges(by_copy, owned);
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
@@ -5203,7 +5284,7 @@ impl Host {
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, by_copy, lists: flying, target, .. } = &mut *line;
             join_ranges(
                 written,
                 sent.back
@@ -5211,6 +5292,8 @@ impl Host {
                     .flat_map(|(_, ranges)| ranges.iter().copied())
                     .chain(sent.texture_back_ranges.iter().copied()),
             );
+            join_copy_ranges(by_copy, owned_writes(&sent.back)
+                .chain(sent.texture_back_ranges.iter().map(|&(a, b)| (0, a, b))));
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -5258,7 +5341,7 @@ impl Host {
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, by_copy, lists: flying, target, .. } = &mut *line;
             join_ranges(
                 written,
                 sent.back
@@ -5266,6 +5349,8 @@ impl Host {
                     .flat_map(|(_, ranges)| ranges.iter().copied())
                     .chain(sent.texture_back_ranges.iter().copied()),
             );
+            join_copy_ranges(by_copy, owned_writes(&sent.back)
+                .chain(sent.texture_back_ranges.iter().map(|&(a, b)| (0, a, b))));
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -5325,6 +5410,7 @@ impl Host {
                 }
                 line.settling = true;
                 line.written.clear();
+                line.by_copy.clear();
                 line.lists = 0;
                 std::mem::take(&mut line.line)
             };
@@ -5521,7 +5607,8 @@ impl Host {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| {
-                    blocked_by(&line.written, runs, false).is_none() && !card_steps::copied_read(&card_steps::copies(line), runs)
+                    let (written, by_copy) = line.hazards();
+                    blocked_by(&written, &by_copy, runs, false).is_none() && !card_steps::copied_read(&card_steps::copies(line), runs)
                 });
             } else {
                 self.settle(&mut submitted, why);
