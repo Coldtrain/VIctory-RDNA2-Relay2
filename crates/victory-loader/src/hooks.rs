@@ -108,6 +108,98 @@ fn render_scale_patches(base: usize, scale: f32, fsr: bool) -> Vec<OwnedPatch> {
     patches
 }
 
+// Opt-in port of Foxhound's prepare_upscaler (from DexNom), GPL-3.0-or-later.
+// Select renderer 7, set its quality mode and sizing branch, and match the
+// temporal scene scale. Xbox FidelityFX acceptance of non-stock sizes is
+// experimental: upstream replaces its actual upscale with DLSS.
+const STOCK_SIZING_ENV: &str = "VICTORY_FSR_STOCK_SIZING";
+const STOCK_SIZING_BUILD: &str = "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93";
+const STOCK_CHECKS: [(usize, usize, &str); 4] = [
+    (0x7e9421, 8, "f0633abf37df17124108b1e37be64645bd4b2412b0524c2f89334f22bd948464"),
+    (0x28ef69a, 14, "2ae2ac102d12ca003cb218413ef018e4dba68fc2003654a30c1743e13a820ffd"),
+    (0x28ef6a8, 10, "2579c24601d173b086a8136edf54ffd82720e6bf186f9139274bb09a45ddadf5"),
+    (0x28ef6b2, 8, "e218882c95d2e16163a409d55b3451519414eb87c4d6220785dc09852d4e14f4"),
+];
+
+fn stock_mode(scale: f32) -> Option<(u8, f32)> {
+    [(0, 1.0), (1, 2.0/3.0), (2, 0.58), (3, 0.5), (4, 1.0/3.0)]
+        .into_iter().find(|&(_, v)| (v - scale).abs() < 0.001)
+}
+
+fn stock_writes(mode: u8, scale: f32) -> Vec<(usize, Vec<u8>)> {
+    let mut writes = vec![
+        (0x7e9421, vec![0xb8, 7, 0, 0, 0, 0x90, 0x90, 0x90]),
+        (0x28ef69a, vec![0xb8, mode, 0, 0, 0, 0x41, 0x89, 0x86, 0x90, 0, 0, 0, 0xeb, 0x0a]),
+        (0x28f1e7e, scale.to_le_bytes().to_vec()),
+    ];
+    if mode != 1 {
+        // Same unreachable native load literal and RIP-relative load as
+        // upstream; the shared 2/3 constant is not overwritten.
+        writes.push((0x28ef6ac, scale.to_le_bytes().to_vec()));
+        let disp = 0x28ef6ac_i32 - (0x28ef6b2_i32 + 8);
+        writes.push((0x28ef6b6, disp.to_le_bytes().to_vec()));
+    }
+    writes
+}
+
+/// Check ALL original bytes before writing, acquire all page protections
+/// before writing, and restore in reverse order (some share a page).
+/// SAFETY: exact original title image mapped, title code not yet running.
+unsafe fn stock_sizing(base: usize, hash: &blake3::Hash, scale: f32) -> usize {
+    let Some((mode, scale)) = stock_mode(scale) else {
+        tracing::warn!(scale, "stock sizing accepts 1, 0.666667, 0.58, 0.5, 0.333333");
+        return 0;
+    };
+    if hash.to_hex().as_str() != STOCK_SIZING_BUILD { return 0; }
+    for (rva, len, expected) in STOCK_CHECKS {
+        let bytes = unsafe { std::slice::from_raw_parts((base + rva) as *const u8, len) };
+        if blake3::hash(bytes).to_hex().as_str() != expected {
+            tracing::warn!(rva, "stock sizing refused: unexpected instruction hash");
+            return 0;
+        }
+    }
+    for rva in [0x615d95c, 0x28f1e7e] {
+        let bytes = unsafe { std::slice::from_raw_parts((base + rva) as *const u8, 4) };
+        if bytes != (2.0f32/3.0).to_le_bytes() {
+            tracing::warn!(rva, "stock sizing refused: unexpected temporal/FSR scale");
+            return 0;
+        }
+    }
+    let writes = stock_writes(mode, scale);
+    let mut protected: Vec<(*mut std::ffi::c_void, usize, u32)> = Vec::with_capacity(writes.len());
+    for (rva, bytes) in &writes {
+        let at = (base + *rva) as *mut u8;
+        let mut old = 0;
+        if unsafe { VirtualProtect(at as _, bytes.len(), PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
+            for (at, len, old) in protected.into_iter().rev() {
+                let mut ignored = 0;
+                unsafe { VirtualProtect(at, len, old, &mut ignored); }
+            }
+            tracing::warn!("stock sizing refused: cannot protect all patch ranges");
+            return 0;
+        }
+        protected.push((at.cast(), bytes.len(), old));
+    }
+    for (rva, bytes) in &writes {
+        let at = (base + *rva) as *mut u8;
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, bytes.len());
+            FlushInstructionCache(GetCurrentProcess(), at as _, bytes.len());
+        }
+    }
+    for (at, len, old) in protected.into_iter().rev() {
+        let mut ignored = 0;
+        if unsafe { VirtualProtect(at, len, old, &mut ignored) } == 0 {
+            tracing::warn!("stock sizing: failed to restore original page protection");
+        }
+    }
+    tracing::info!(mode, scale, "stock sizing: renderer 7, quality mode and temporal scale synchronized");
+    if mode >= 2 {
+        tracing::warn!(mode, scale, "stock Xbox FidelityFX custom size is experimental; Foxhound uses DLSS at these sizes");
+    }
+    writes.len()
+}
+
 /// The scale `VICTORY_RENDER_SCALE` asks for, if valid.
 fn parse_scale(text: &str) -> Option<f32> {
     let v: f32 = text.trim().parse().ok()?;
@@ -129,6 +221,17 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
     // the 1.0.2.1 executable has the patched places.
     if !hash.to_hex().starts_with(BUILD_1_0_2_1) {
         tracing::debug!("resolution levers: not the 1.0.2.1 executable; nothing patched");
+        return 0;
+    }
+    if std::env::var_os(STOCK_SIZING_ENV).is_some_and(|v| v == "1") {
+        if own {
+            tracing::warn!("stock sizing requires VICTORY_OWN_UPSCALER=0");
+            return 0;
+        }
+        if let Some(scale) = scale.as_deref().and_then(parse_scale) {
+            return unsafe { stock_sizing(base, hash, scale) };
+        }
+        tracing::warn!("stock sizing requires an explicit supported render scale");
         return 0;
     }
     let mut applied = 0;
@@ -185,6 +288,21 @@ unsafe fn apply(base: usize, p: &Patch<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synchronized_stock_sizing_matches_upstream() {
+        assert_eq!(stock_mode(0.5), Some((3, 0.5)));
+        assert_eq!(stock_mode(1.0), Some((0, 1.0)));
+        assert_eq!(stock_mode(0.30), None);
+        let p = stock_writes(3, 0.5);
+        assert_eq!(p[0].1, [0xb8, 7, 0, 0, 0, 0x90, 0x90, 0x90]);
+        assert_eq!(p[1].1[1], 3);
+        assert_eq!(p[1].1[12..], [0xeb, 0x0a]);
+        assert_eq!(p[2].1, 0.5f32.to_le_bytes());
+        assert_eq!(p[3].1, 0.5f32.to_le_bytes());
+        assert_eq!(p[4].1, (-14i32).to_le_bytes());
+        assert_eq!(stock_writes(1, 2.0/3.0).len(), 3);
+    }
 
     #[test]
     fn scales_outside_the_floor_are_refused() {

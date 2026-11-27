@@ -37,10 +37,20 @@ if ($RenderScale -ne 0 -and $RenderScale -lt 0.2) { throw 'RenderScale must be 0
 $settings.VICTORY_RENDER_SCALE = $RenderScale.ToString('G', [System.Globalization.CultureInfo]::InvariantCulture)
 if ($AFMF) { $settings.VICTORY_AFMF = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
-# Keep the stock Series S FSR path unmodified; its custom-scale hook is experimental.
+# Stock with explicit scale opts into the separate Foxhound sizing port.
+# Scale zero keeps the shipping Series S path untouched.
 if ($Upscaler -eq 'stock') {
-    if ($settings.VICTORY_RENDER_SCALE -ne '0') { throw 'Stock upscaler test requires RenderScale 0. Use -Upscaler game for custom internal scale.' }
     $settings.VICTORY_OWN_UPSCALER = '0'
+    if ($settings.VICTORY_RENDER_SCALE -ne '0') {
+        if ($Console -ne 'series-s') { throw 'Experimental stock sizing is only intended for Series S.' }
+        $ratio = [double]::Parse([string]$settings.VICTORY_RENDER_SCALE, [System.Globalization.CultureInfo]::InvariantCulture)
+        if (-not (@(1.0, (2.0/3.0), 0.58, 0.5, (1.0/3.0)) | Where-Object { [Math]::Abs($_ - $ratio) -lt 0.001 })) {
+            throw 'Stock sizing accepts 1, 0.666667, 0.58, 0.5, 0.333333. Other values require -Upscaler game.'
+        }
+        $settings.VICTORY_FSR_STOCK_SIZING = '1'
+    } else {
+        $settings.VICTORY_FSR_STOCK_SIZING = '0'
+    }
 } elseif ($Upscaler -eq 'game') {
     $settings.VICTORY_OWN_UPSCALER = '1'
 } elseif (-not $settings.ContainsKey('VICTORY_OWN_UPSCALER')) {

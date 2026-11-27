@@ -139,3 +139,20 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+## Experimental synchronized stock sizing
+
+Based on Foxhound's native_1440p::prepare_upscaler (from DexNom, GPL-3.0-or-later).
+The opt-in VICTORY_FSR_STOCK_SIZING=1 hook selects renderer 7, writes the
+quality mode, redirects sizing and matches the temporal scale, after verifying
+all original hashes and constants. It does not apply the old forced maximum
+or vtable patch. play.ps1 -Console series-s -Upscaler stock -RenderScale 1
+(or 0.666667, 0.58, 0.5, 0.333333) enables it; scale 0 remains unmodified.
+The Xbox FidelityFX upscaler is documented by Foxhound as working at stock
+Series S sizes; acceptance of smaller custom sizes has NOT been established.
+First test with VICTORY_FSR_FRAMEGEN=0, then repeat the exact same scene
+with VICTORY_FSR_FRAMEGEN=1 and VICTORY_FSR_SDK_DLL pointing to the existing
+SDK. Look for 'stock sizing: renderer 7, quality mode and temporal scale
+synchronized' and actual render dimensions in 'submitted FidelityFX inputs'.
+Use scale 0 or the original branch if custom sizes fail. The game temporal
+renderer remains unchanged, and its independent FG capture is not implemented.
