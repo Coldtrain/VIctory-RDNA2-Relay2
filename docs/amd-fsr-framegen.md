@@ -59,6 +59,18 @@ visible artifacts and latency; AMD recommends a much higher base rate. Frame
 generation does not speed up simulation or real rendering. Disable overlays
 which hook DXGI if they interfere with the replacement swapchain.
 
+## Presentation meter
+
+The window caption shows native/present FPS, the AMD FG state and estimated
+extra present FPS. The DXGI count is sampled once per second from the real
+swapchain (the SDK forwards GetLastPresentCount). Native FPS counts successful
+calls to the replacement swapchain; the excess estimates generated presents.
+The asynchronous SDK presenter can cross sample boundaries; the estimate is
+not an exact per-frame classification or proof of scanout. The log also shows
+successful interpolation dispatches per second separately. A failed or first
+sample displays -- rather than assuming 2x. Without an AMD swapchain, FG OFF
+is shown. No waits, changes to the upscaler, or synthetic counters are added.
+
 ## Implementation and limitations
 
 Capture is held by the host command list (including thin-list interpreter),

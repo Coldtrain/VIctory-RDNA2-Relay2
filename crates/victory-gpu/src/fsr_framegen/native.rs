@@ -170,6 +170,12 @@ pub(crate) struct Backend {
     hudless: VecDeque<ID3D12Resource>,
 }
 impl Backend {
+    pub(crate) fn status(&self) -> &'static str {
+        if self.faulted || FAILED_CALLBACKS.load(Ordering::Relaxed) != 0 { "ERROR" }
+        else if self.enabled { "ON" } else { "WAITING" }
+    }
+    pub(crate) fn callback_count(&self) -> u64 { CALLBACKS.load(Ordering::Relaxed) }
+
     pub(crate) fn create(factory: &IDXGIFactory2, queue: &ID3D12CommandQueue, hwnd: HWND,
         desc: &DXGI_SWAP_CHAIN_DESC1) -> Option<(IDXGISwapChain3, Self)> {
         let on = |k| std::env::var_os(k).is_some_and(|v| v == "1");

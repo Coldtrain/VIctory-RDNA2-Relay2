@@ -8808,6 +8808,10 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    // Sample real DXGI presents, not the replacement swapchain's game presents.
+    fsr_present_count: Option<u32>,
+    fsr_native_presents: u32,
+    fsr_callbacks: u64,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
@@ -8822,6 +8826,9 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            fsr_present_count: None,
+            fsr_native_presents: 0,
+            fsr_callbacks: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
@@ -8837,12 +8844,13 @@ impl Meter {
     }
 
     /// Counts a presented frame.
-    fn frame(&mut self, hwnd: HWND) {
+    fn frame(&mut self, hwnd: HWND, swap: &IDXGISwapChain3, fsr: Option<&crate::fsr_framegen::Backend>, present_ok: bool) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        if fsr.is_some() && present_ok { self.fsr_native_presents += 1; }
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -9090,8 +9098,34 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = if afmf_requested() {
+        let fsr_requested = std::env::var_os("VICTORY_FSR_FRAMEGEN").is_some_and(|v| v == "1");
+        let text = if let Some(fsr) = fsr {
+            // AMD SDK 1.1.4 forwards this method to the real DXGI swapchain.
+            // Count once per meter interval, without waiting for its presenter.
+            let current = unsafe { swap.GetLastPresentCount() }.ok();
+            let previous = std::mem::replace(&mut self.fsr_present_count, current);
+            let native = std::mem::take(&mut self.fsr_native_presents);
+            let callbacks = fsr.callback_count();
+            let callback_delta = callbacks.saturating_sub(self.fsr_callbacks);
+            self.fsr_callbacks = callbacks;
+            let seconds = elapsed.as_secs_f64();
+            let native_fps = f64::from(native) / seconds;
+            let callback_fps = callback_delta as f64 / seconds;
+            let status = fsr.status();
+            // Async presents can straddle intervals; the excess is an estimate,
+            // not a count of frames actually scanned out by the monitor.
+            if let Some(delta) = previous.zip(current).and_then(|(a,b)| b.checked_sub(a)) {
+                let total = f64::from(delta) / seconds;
+                let extra = f64::from(delta.saturating_sub(native)) / seconds;
+                tracing::info!(native_fps, present_fps=total, extra_present_fps=extra, interpolation_dispatch_fps=callback_fps, status, "FSR FG: presentation meter");
+                format!(" | VIctory {native_fps:.0}/{total:.0} FPS (native/present) | FSR FG {status} | +{extra:.0} est FG | {ms:.1} ms/frame")
+            } else {
+                format!(" | VIctory {native_fps:.0}/-- FPS (native/present) | FSR FG {status} | {callback_fps:.0} dispatch/s")
+            }
+        } else if afmf_requested() {
             format!(" | VIctory Base: {fps:.0} FPS | AFMF: see AMD overlay | {ms:.1} ms/frame")
+        } else if fsr_requested {
+            format!(" | VIctory {fps:.0} FPS | FSR FG OFF (no AMD swapchain) | {ms:.1} ms/frame")
         } else {
             format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame")
         };
@@ -9429,7 +9463,7 @@ impl Host {
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
-            p.meter.frame(p.hwnd);
+            p.meter.frame(p.hwnd, &p.swap_chain, p.fsr.as_ref(), present_result.is_ok());
             showing.end();
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
