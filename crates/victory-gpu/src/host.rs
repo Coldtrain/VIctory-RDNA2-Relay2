@@ -150,19 +150,23 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+    vram_keep_policy(budget, used, crate::resource::amd_texture_budget())
+}
+
+fn vram_keep_policy(budget: u64, used: u64, amd: bool) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
-    const SHORT_MS: u64 = 1_500;
+    let short_ms = if amd { 3_000 } else { 1_500 };
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    if used < share(if amd { 85 } else { 88 }) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    } else if used < share(if amd { 93 } else { 95 }) {
+        (IDLE_MS, used - share(if amd { 80 } else { 85 }))
     } else {
-        (SHORT_MS, used - share(85))
+        (short_ms, used - share(if amd { 84 } else { 85 }))
     }
 }
 
@@ -11100,8 +11104,11 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn textures_are_kept_while_the_card_has_room() {
-        use super::vram_keep;
+        let vram_keep = |budget, used| super::vram_keep_policy(budget, used, false);
         let gib = 1 << 30;
+        assert_eq!(super::vram_keep_policy(100 * gib, 84 * gib, true), (600_000, u64::MAX));
+        assert_eq!(super::vram_keep_policy(100 * gib, 88 * gib, true), (5_000, 8 * gib));
+        assert_eq!(super::vram_keep_policy(100 * gib, 95 * gib, true), (3_000, 11 * gib));
         assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
         // Past it: the longest idle ones, enough to come down to 85 %.
         let (ms, bytes) = vram_keep(100 * gib, 90 * gib);
