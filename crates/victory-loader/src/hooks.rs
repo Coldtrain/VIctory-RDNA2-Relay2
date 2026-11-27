@@ -126,6 +126,12 @@ fn stock_mode(scale: f32) -> Option<(u8, f32)> {
         .into_iter().find(|&(_, v)| (v - scale).abs() < 0.001)
 }
 
+// Native FSR overrides the mode-4 sizing queries as well as the title's
+// two scale constants. Do not change the shipping provider's preset path.
+fn native_low_mode(scale: f32) -> Option<(u8, f32)> {
+    (0.2..0.5).contains(&scale).then_some((4, scale))
+}
+
 fn stock_writes(mode: u8, scale: f32) -> Vec<(usize, Vec<u8>)> {
     let mut writes = vec![
         (0x7e9421, vec![0xb8, 7, 0, 0, 0, 0x90, 0x90, 0x90]),
@@ -146,8 +152,9 @@ fn stock_writes(mode: u8, scale: f32) -> Vec<(usize, Vec<u8>)> {
 /// before writing, and restore in reverse order (some share a page).
 /// SAFETY: exact original title image mapped, title code not yet running.
 unsafe fn stock_sizing(base: usize, hash: &blake3::Hash, scale: f32) -> usize {
-    let Some((mode, scale)) = stock_mode(scale) else {
-        tracing::warn!(scale, "stock sizing accepts 1, 0.666667, 0.58, 0.5, 0.333333");
+    let native = std::env::var_os("VICTORY_FSR_UPSCALER").is_some_and(|v| v == "1");
+    let Some((mode, scale)) = (if native { native_low_mode(scale).or_else(|| stock_mode(scale)) } else { stock_mode(scale) }) else {
+        tracing::warn!(scale, native, "unsupported FidelityFX scale; native AMD supports custom 0.20–0.50");
         return 0;
     };
     if hash.to_hex().as_str() != STOCK_SIZING_BUILD { return 0; }
@@ -194,7 +201,9 @@ unsafe fn stock_sizing(base: usize, hash: &blake3::Hash, scale: f32) -> usize {
         }
     }
     tracing::info!(mode, scale, "stock sizing: renderer 7, quality mode and temporal scale synchronized");
-    if mode >= 2 {
+    if native && scale < 0.5 {
+        tracing::info!(mode, scale, "native AMD custom sizing: mode 4 with synchronized scale queries");
+    } else if mode >= 2 && !native {
         tracing::warn!(mode, scale, "stock Xbox FidelityFX custom size is experimental; Foxhound uses DLSS at these sizes");
     }
     writes.len()
@@ -294,6 +303,15 @@ mod tests {
         assert_eq!(stock_mode(0.5), Some((3, 0.5)));
         assert_eq!(stock_mode(1.0), Some((0, 1.0)));
         assert_eq!(stock_mode(0.30), None);
+        assert_eq!(native_low_mode(0.30), Some((4, 0.30)));
+        assert_eq!(native_low_mode(0.20), Some((4, 0.20)));
+        assert_eq!(native_low_mode(0.50), None);
+        assert_eq!(native_low_mode(0.19), None);
+        assert_eq!(native_low_mode(f32::NAN), None);
+        let low = stock_writes(4, 0.30);
+        assert_eq!(low[1].1[1], 4);
+        assert_eq!(low[2].1, 0.30f32.to_le_bytes());
+        assert_eq!(low[3].1, 0.30f32.to_le_bytes());
         let p = stock_writes(3, 0.5);
         assert_eq!(p[0].1, [0xb8, 7, 0, 0, 0, 0x90, 0x90, 0x90]);
         assert_eq!(p[1].1[1], 3);

@@ -191,3 +191,20 @@ VICTORY_PLACED_FILLER=1 also disables normalization. Log once when shape
 capacity is reached. This addresses a concrete duplicate-key mechanism;
 the access violation's exact cause is not established. Repeat the same
 long session with commit headroom and descriptor counts monitored.
+
+## Experimental lower custom AMD render scales
+
+On the Belobug sprint 1 baseline, native AMD SR accepts startup scale 0
+(stock) or 0.20 through 0.50 inclusive. Below 0.50, the hash-guarded title
+hook uses mode 4 and writes the exact requested scale to both sizing
+constants. Matching mode-4 FidelityFX ratio and resolution queries return
+1/scale and truncated display dimensions multiplied by scale; SDK jitter
+queries and resource validation are unchanged. Stock/0.50 behavior is
+preserved. The real context/dispatch and depth/motion resource dimensions
+must be confirmed in the log; these are not guaranteed by a requested scale.
+Example: -Console series-s -RenderScale 0.30 -Upscaler amd, expected
+576x324 internal at 1920x1080 output. Test FG off first, then FG on. Use
+0.50 to return to the validated configuration. These are configurable
+launch-time scales, not automatic per-frame dynamic resolution or hot
+switching. Windows compile and GPU tests pending. Main and the original
+Sprint 1 branch are unchanged.

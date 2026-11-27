@@ -2,7 +2,7 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Console      series-x (default) or series-s (1080p reported by default)
 # -RenderScale  0 (stock) or 0.2..1.0 (internal scale)
-# -Upscaler     auto (default), game (title temporal), stock (console default)
+# -Upscaler     auto (default), game (title temporal), stock (console default), amd (native FSR)
 # -AFMF         request borderless fullscreen for driver AFMF (enable per-app in Adrenalin)
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
@@ -42,9 +42,11 @@ foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 if ($Upscaler -eq 'amd') {
     if ($Console -ne 'series-s') { throw 'Native AMD upscaling test requires Series S.' }
     if ($settings.VICTORY_DISPLAY_MODE -ne '1920x1080') { throw 'Native AMD upscaling test requires 1080p output.' }
-    if ($settings.VICTORY_RENDER_SCALE -ne '0' -and $settings.VICTORY_RENDER_SCALE -ne '0.5') {
-        throw 'First native AMD test supports stock sizing (0) or 0.50 only.'
+    $ratio = [double]::Parse([string]$settings.VICTORY_RENDER_SCALE, [System.Globalization.CultureInfo]::InvariantCulture)
+    if ($ratio -ne 0 -and (-not ($ratio -ge 0.2 -and $ratio -le 0.5))) {
+        throw 'Native AMD upscaling accepts stock sizing (0) or custom 0.20 through 0.50 (experimental below 0.50).'
     }
+    $settings.VICTORY_RENDER_SCALE = $ratio.ToString('G', [System.Globalization.CultureInfo]::InvariantCulture)
     if (-not $settings.VICTORY_FSR_SDK_DLL -or -not (Test-Path $settings.VICTORY_FSR_SDK_DLL)) {
         throw 'Supply VICTORY_FSR_SDK_DLL in -More.'
     }

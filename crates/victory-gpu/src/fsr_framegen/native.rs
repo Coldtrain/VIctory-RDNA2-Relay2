@@ -176,12 +176,91 @@ static UPSCALERS: Mutex<Vec<Arc<Upscaler>>> = Mutex::new(Vec::new());
 
 pub(super) fn sdk_ready() -> bool { api().is_some() }
 
+// SDK 1.1.4 ffx_upscale.h: context-independent mode queries, x64 ABI.
+#[repr(C)]
+struct QueryRatio { header: Header, mode: u32, out: *mut f32 }
+#[repr(C)]
+struct QueryResolution {
+    header: Header, width: u32, height: u32, mode: u32,
+    out_width: *mut u32, out_height: *mut u32,
+}
+const _: () = {
+    assert!(size_of::<QueryRatio>() == 32);
+    assert!(offset_of!(QueryRatio, out) == 24);
+    assert!(size_of::<QueryResolution>() == 48);
+    assert!(offset_of!(QueryResolution, out_width) == 32);
+    assert!(offset_of!(QueryResolution, out_height) == 40);
+};
+fn low_scale() -> Option<f32> {
+    static SCALE: OnceLock<Option<f32>> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        if !std::env::var_os("VICTORY_FSR_STOCK_SIZING").is_some_and(|v| v == "1") {
+            return None;
+        }
+        let scale = std::env::var("VICTORY_RENDER_SCALE").ok()?.trim().parse::<f32>().ok()?;
+        (0.2..0.5).contains(&scale).then_some(scale)
+    })
+}
+fn scaled_extent(size: u32, scale: f32) -> u32 {
+    ((size as f32 * scale) as u32).max(1)
+}
+
+/// Only the custom native mode (4) is overridden. The SDK still supplies
+/// jitter phase/offset using the actual render dimensions, and stock/0.5
+/// queries remain unchanged. Header kind and null chain checked by caller.
+unsafe fn custom_scale_query(header: *mut Header, scale: f32) -> Option<u32> {
+    match unsafe { (*header).kind } {
+        0x10002 => {
+            let q = unsafe { &*header.cast::<QueryRatio>() };
+            if q.mode != 4 { return None; }
+            if !q.out.is_null() { unsafe { q.out.write(1.0 / scale) }; }
+            static LOG: std::sync::Once = std::sync::Once::new();
+            LOG.call_once(|| tracing::info!(scale, ratio=1.0/scale, "FSR SR: custom upscale ratio query"));
+            Some(0)
+        }
+        0x10003 => {
+            let q = unsafe { &*header.cast::<QueryResolution>() };
+            if q.mode != 4 || q.width == 0 || q.height == 0 { return None; }
+            let render = [scaled_extent(q.width,scale),scaled_extent(q.height,scale)];
+            if !q.out_width.is_null() { unsafe { q.out_width.write(render[0]) }; }
+            if !q.out_height.is_null() { unsafe { q.out_height.write(render[1]) }; }
+            static LOG: std::sync::Once = std::sync::Once::new();
+            LOG.call_once(|| tracing::info!(scale, ?render, display=?[q.width,q.height], "FSR SR: custom render resolution query"));
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod custom_scale_tests {
+    use super::*;
+    #[test]
+    fn mode4_queries_match_custom_scale() {
+        let mut ratio = 0.0;
+        let mut q = QueryRatio { header:Header::new(0x10002), mode:4, out:&mut ratio };
+        assert_eq!(unsafe { custom_scale_query(&mut q.header,0.30) }, Some(0));
+        assert!((ratio-1.0/0.30).abs() < 0.00001);
+        q.mode = 3;
+        assert_eq!(unsafe { custom_scale_query(&mut q.header,0.30) }, None);
+        let (mut w,mut h)=(0,0);
+        let mut q = QueryResolution { header:Header::new(0x10003),width:1920,height:1080,mode:4,out_width:&mut w,out_height:&mut h };
+        for (scale,expected) in [(0.40,[768,432]),(0.30,[576,324]),(0.25,[480,270]),(0.20,[384,216])] {
+            assert_eq!(unsafe { custom_scale_query(&mut q.header,scale) }, Some(0));
+            assert_eq!([w,h],expected);
+        }
+    }
+}
+
 pub(super) unsafe fn upscale_query(desc: *mut c_void) -> Option<u32> {
     if desc.is_null() { return None; }
     let header = desc.cast::<Header>();
     if !matches!(unsafe { (*header).kind }, 0x10002..=0x10005) ||
        !unsafe { (*header).next }.is_null() { return None; }
     let api = api()?;
+    if let Some(scale) = low_scale() {
+        if let Some(code) = unsafe { custom_scale_query(header, scale) } { return Some(code); }
+    }
     // These four queries are context-independent in the SDK provider.
     Some(unsafe { (api.query)(std::ptr::null_mut(), header) })
 }
