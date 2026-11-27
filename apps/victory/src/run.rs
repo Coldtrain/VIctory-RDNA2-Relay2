@@ -158,11 +158,12 @@ pub fn run(
             println!("  missing      {}!{}", m.dll, m.symbol);
         }
     };
+    let ffx = victory_hle::modules::fidelityfx_framegen::Interpose { inner: &with_dlls };
     for (name, dll) in &dlls {
-        show(name, dll.bind_imports(&with_dlls, policy)?);
+        show(name, dll.bind_imports(&ffx, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    show(&exe_name, image.bind_imports(&ffx, policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
@@ -360,7 +361,8 @@ impl LateDlls {
                         "title dll      {name} at {:#x} (loaded by the title)",
                         dll.base()
                     );
-                    show(name, dll.bind_imports(&resolver, self.policy)?);
+                    let ffx = victory_hle::modules::fidelityfx_framegen::Interpose { inner: &resolver };
+                    show(name, dll.bind_imports(&ffx, self.policy)?);
                     set_image_path(dll.base(), &self.title_dir.join(name));
                 }
                 // Visible before their `DllMain`s run, which may load more.

@@ -83,6 +83,7 @@ impl Front {
         {
             recording.abandoned.store(true, Release);
         }
+        discard_fsr(&self.words);
         self.words.clear();
     }
 
@@ -266,6 +267,7 @@ impl Recording {
 impl Drop for Recording {
     fn drop(&mut self) {
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
+        for chunk in &inner.chunks { discard_fsr(chunk); }
         give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)).collect());
         if inner.back != 0 {
             if !inner.closed {
@@ -483,6 +485,31 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const FSR_CAPTURE: u64 = after(17);
+
+/// Box ownership passes from the front to the translator, or to the
+/// abandonment cleanup. Translated chunks never free the box a second time.
+pub(super) fn put_fsr(this: This, input: crate::fsr_framegen::Captured) -> Result<(), crate::fsr_framegen::Captured> {
+    if !wanted() || !on() { return Err(input); }
+    let front = front(this);
+    if front.closed || front.recording.is_none() { return Err(input); }
+    front.put(FSR_CAPTURE, &[Box::into_raw(Box::new(input)) as u64]);
+    Ok(())
+}
+
+fn discard_fsr(words: &[u64]) {
+    let mut at = 0;
+    while at < words.len() {
+        let op = words[at] & 0xffff;
+        let len = (words[at] >> 16) as usize;
+        if op == FSR_CAPTURE {
+            // SAFETY: only called for chunks never interpreted.
+            drop(unsafe { Box::from_raw(words[at + 1] as *mut crate::fsr_framegen::Captured) });
+        }
+        at += 1 + len;
+    }
+}
+
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -711,6 +738,14 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             // SAFETY: a list of ours.
             let uploads = unsafe { &(*list.cast::<List>()).uploads };
             held(uploads).push(block);
+            continue;
+        }
+        if op == FSR_CAPTURE {
+            // SAFETY: each capture box is taken exactly once by this interpreter.
+            let input = *unsafe { Box::from_raw(w[0] as *mut crate::fsr_framegen::Captured) };
+            if !skip {
+                if let Some(host) = super::host_list(list) { host.note_fsr(input); }
+            }
             continue;
         }
         if skip && op != CLOSE && op != RESET {

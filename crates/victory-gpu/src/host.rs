@@ -1167,6 +1167,7 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    fsr_capture: Mutex<Option<crate::fsr_framegen::Captured>>,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
@@ -4101,6 +4102,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                fsr_capture: Mutex::default(),
                 twins: Mutex::default(),
                 prelude: Mutex::default(),
                 pipelines,
@@ -5491,6 +5493,11 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        for run in runs {
+            if let Some(input) = run.fsr_capture.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                crate::fsr_framegen::submitted(input);
+            }
+        }
         let was_working = working(true);
         submitting(1, runs.len());
         #[cfg(feature = "diagnostics")]
@@ -6196,6 +6203,10 @@ impl Host {
 }
 
 impl HostList {
+    pub(crate) fn note_fsr(&self, input: crate::fsr_framegen::Captured) {
+        *self.fsr_capture.lock().unwrap_or_else(|e| e.into_inner()) = Some(input);
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -6339,6 +6350,7 @@ impl HostList {
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.fsr_capture.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]

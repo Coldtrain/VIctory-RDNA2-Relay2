@@ -160,6 +160,17 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     crate::copystat::recorded(started);
 }
 
+/// Record one FidelityFX capture at its position in either list implementation.
+#[cfg(windows)]
+pub(crate) fn record_fsr(this: This, input: crate::fsr_framegen::Captured) {
+    if this.is_null() { return; }
+    let input = match thin::put_fsr(this, input) {
+        Ok(()) => return,
+        Err(input) => input,
+    };
+    if let Some(host) = host_list(this) { host.note_fsr(input); }
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.
