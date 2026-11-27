@@ -3,7 +3,7 @@
 //! ffx_api.h, ffx_api_types.h, ffx_framegeneration.h, dx12/ffx_api_dx12.h.
 //! Copyright (C) 2024 Advanced Micro Devices, Inc. See docs/amd-fsr-framegen.md.
 //! The SDK is supplied by the user, never loaded from the current directory.
-use super::Captured;
+use super::{Captured, FrameMeta};
 use crate::host::{HostList, legal_state};
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
@@ -51,6 +51,14 @@ struct Configure {
     enabled: bool, allow_async: bool, hudless: Resource,
     flags: u32, only_generated: bool, rect: [i32; 4], frame_id: u64,
 }
+// The SDK's dispatch descriptor, not Prepare's unused_reset field.
+// ffx_api/ffx_framegeneration.h, SDK 1.1.4 x64.
+#[repr(C)]
+struct GenerateDesc {
+    header: Header, list: *mut c_void, present_color: Resource, outputs: [Resource; 4],
+    num_generated: u32, reset: bool, transfer: u32, luminance: [f32; 2],
+    rect: [i32; 4], frame_id: u64,
+}
 #[repr(C)]
 struct CameraInfo {
     header: Header, position: [f32; 3], up: [f32; 3], right: [f32; 3], forward: [f32; 3],
@@ -70,6 +78,9 @@ const _: () = {
     assert!(size_of::<FrameDesc>() == 40);
     assert!(size_of::<Configure>() == 144);
     assert!(size_of::<CameraInfo>() == 64);
+    assert!(size_of::<GenerateDesc>() == 312);
+    assert!(offset_of!(GenerateDesc, reset) == 268);
+    assert!(offset_of!(GenerateDesc, frame_id) == 304);
     assert!(size_of::<Prepare>() == 184);
     assert!(offset_of!(Configure, hudless) == 64);
     assert!(offset_of!(Configure, frame_id) == 136);
@@ -83,6 +94,50 @@ struct Api { create: Create, destroy: Destroy, configure: Call, dispatch: Call, 
 static API: OnceLock<Option<Api>> = OnceLock::new();
 static CALLBACKS: AtomicU64 = AtomicU64::new(0);
 static FAILED_CALLBACKS: AtomicU64 = AtomicU64::new(0);
+// One presenter, synchronous SDK interpolation recording. Match the exact
+// callback frame ID rather than resetting an unrelated in-flight frame.
+static RESET_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn history_break(previous: Option<(FrameMeta, bool)>, m: FrameMeta, hudless: bool) -> bool {
+    m.reset || previous.is_none_or(|(p, h)| {
+        p.render != m.render || p.output != m.output || p.flags != m.flags ||
+        p.motion_scale != m.motion_scale || h != hudless ||
+        (p.fov - m.fov).abs() > 0.05 ||
+        (p.near - m.near).abs() > p.near.abs() * 0.1 ||
+        (p.far - m.far).abs() > p.far.abs() * 0.1
+    })
+}
+
+// Optional explicit scene rectangle for letterboxed content, in output pixels.
+// Never guess a crop: without a verified rectangle use the entire backbuffer.
+fn generation_rect(size: [u32; 2]) -> [i32; 4] {
+    static RECT: OnceLock<Option<[i32; 4]>> = OnceLock::new();
+    let full = [0, 0, size[0] as i32, size[1] as i32];
+    let chosen = RECT.get_or_init(|| {
+        let value = std::env::var("VICTORY_FSR_RECT").ok()?;
+        let values: Option<Vec<i32>> = value.split(',').map(|s| s.trim().parse().ok()).collect();
+        let parsed = values.and_then(|v| <[i32; 4]>::try_from(v).ok());
+        if parsed.is_none() {
+            tracing::warn!("FSR FG: invalid VICTORY_FSR_RECT; expected left,top,width,height");
+        }
+        parsed
+    });
+    if let Some([x,y,w,h]) = *chosen {
+        if x >= 0 && y >= 0 && w > 0 && h > 0 &&
+            x.checked_add(w).is_some_and(|right| right <= full[2]) &&
+            y.checked_add(h).is_some_and(|bottom| bottom <= full[3]) {
+            return [x,y,w,h];
+        }
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| tracing::warn!("FSR FG: VICTORY_FSR_RECT outside output; using full frame"));
+    }
+    full
+}
+
+fn hudless_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !std::env::var_os("VICTORY_FSR_HUDLESS").is_some_and(|v| v == "0"))
+}
 
 fn api() -> Option<&'static Api> {
     API.get_or_init(|| match load() {
@@ -147,6 +202,15 @@ impl Frame {
 unsafe extern "C" fn generate(desc: *mut Header, user: *mut c_void) -> u32 {
     if desc.is_null() || user.is_null() { return 6; }
     let Some(api) = API.get().and_then(Option::as_ref) else { return 6; };
+    if unsafe { (*desc).kind } == 0x20003 {
+        // SAFETY: exact SDK descriptor type, verified by tag and ABI asserts.
+        let generated = unsafe { &mut *desc.cast::<GenerateDesc>() };
+        if RESET_FRAME.compare_exchange(generated.frame_id, u64::MAX,
+            Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            generated.reset = true;
+            tracing::info!(id=generated.frame_id, "FSR FG: interpolation history reset");
+        }
+    }
     let code = unsafe { (api.dispatch)(user.cast(), desc) };
     if code == 0 {
         let n = CALLBACKS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -167,6 +231,7 @@ pub(crate) struct Backend {
     faulted: bool,
     next_id: u64,
     prepared: u64,
+    previous: Option<(FrameMeta, bool)>,
     hudless: VecDeque<ID3D12Resource>,
 }
 impl Backend {
@@ -212,13 +277,13 @@ impl Backend {
         };
         tracing::info!("FSR FG: native AMD interpolation swapchain created");
         Some((chain, Self { swap_ctx, frame: None, enabled: false, faulted: false,
-            next_id: 0, prepared: 0, hudless: VecDeque::new() }))
+            next_id: 0, prepared: 0, previous: None, hudless: VecDeque::new() }))
     }
 
     fn configure(&self, swap: &IDXGISwapChain3, enabled: bool, id: u64, hudless: Resource) -> bool {
         let Some(frame) = &self.frame else { return !enabled; };
         let Some(api) = api() else { return false; };
-        let [w,h] = frame.key.display;
+        let rect = generation_rect(frame.key.display);
         // Use the exact interface type returned by the SDK rather than
         // assuming a queried IDXGISwapChain3 pointer is identical.
         let Ok(swap4) = swap.cast::<IDXGISwapChain4>() else { return false; };
@@ -227,12 +292,13 @@ impl Backend {
             generate_cb: if enabled { Some(generate) } else { None },
             generate_user: if enabled { frame.handle().cast() } else { std::ptr::null_mut() },
             enabled, allow_async: false, hudless, flags: 0, only_generated: false,
-            rect: [0,0,w as i32,h as i32], frame_id: id };
+            rect, frame_id: id };
         let code = unsafe { (api.configure)(frame.handle(), &cfg.header) };
         if code != 0 { tracing::warn!(code, enabled, id, "FSR FG: configure failed"); }
         code == 0
     }
     fn disable(&mut self, swap: &IDXGISwapChain3, id: u64) -> bool {
+        self.previous = None;
         if !self.enabled { return true; }
         if !self.configure(swap, false, id, Resource::empty()) {
             self.faulted = true;
@@ -301,7 +367,7 @@ impl Backend {
         let m = input.meta;
         // The title's shipping FidelityFX path only accepts its Series S
         // resolutions. Start with SDR 1080p; no image patch or fake upscaling.
-        if display_size != [1920,1080] || m.output != display_size || m.reset ||
+        if display_size != [1920,1080] || m.output != display_size ||
             m.max_render.contains(&0) || m.render.contains(&0) ||
             m.render.iter().zip(m.max_render).any(|(&a,b)| a > b) ||
             !matches!(format.0, 28 | 87) ||
@@ -339,7 +405,7 @@ impl Backend {
         // On Series S the first plane excludes the separate premultiplied
         // interface. Use it as HUD-less colour only with a matching format,
         // dimensions and SDK-representable resource state.
-        let hudless = if composed {
+        let hudless = if composed && hudless_requested() {
             ffx_state(scene_state).and_then(|state| resource(scene,state))
                 .filter(|r| r.desc[1] == key.format && [r.desc[2],r.desc[3]] == display_size)
         } else { None };
@@ -347,11 +413,13 @@ impl Backend {
             self.faulted = true; self.disable(swap,id); return;
         }
         if hudless.is_some() { self.hudless.push_back(scene.clone()); }
+        let reset_history = history_break(self.previous, m, hudless.is_some());
+        if reset_history { RESET_FRAME.store(id, Ordering::Release); }
         if !self.configure(swap,true,id,hudless.unwrap_or_else(Resource::empty)) {
             // A failed configure may have changed the provider; explicitly disable it.
             self.enabled = true; self.faulted = true; self.disable(swap,id); return;
         }
-        if !self.enabled { tracing::info!(id, hudless = hudless.is_some(), "FSR FG: enabled"); }
+        if !self.enabled { tracing::info!(id, hudless = hudless.is_some(), rect=?generation_rect(display_size), "FSR FG: enabled"); }
         self.enabled = true;
         let frame_ctx = self.frame.as_ref().expect("created above").handle();
         let Some(api) = api() else { return; };
@@ -376,6 +444,7 @@ impl Backend {
             tracing::warn!(code,id,"FSR FG: prepare dispatch failed; disabling");
             self.faulted = true; self.disable(swap,id); return;
         }
+        self.previous = Some((m, hudless.is_some()));
         self.prepared += 1;
         if self.prepared == 1 || self.prepared % 120 == 0 {
             tracing::info!(id, prepared=self.prepared, generated_dispatches=CALLBACKS.load(Ordering::Relaxed),
@@ -387,6 +456,18 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn discontinuity_resets_history() {
+        let a = FrameMeta { flags: 41, render: [1280,720], output: [1920,1080],
+            max_render: [1280,720], jitter: [0.0;2], motion_scale: [1.0;2],
+            frame_ms: 50.0, near: 10000.0, far: 0.15, fov: 0.47108993,
+            meters: 0.0, reset: false };
+        assert!(history_break(None, a, true));
+        assert!(!history_break(Some((a,true)), FrameMeta { jitter: [0.2,-0.3], ..a }, true));
+        assert!(history_break(Some((a,true)), FrameMeta { fov: 0.66059464, ..a }, true));
+        assert!(history_break(Some((a,true)), FrameMeta { reset: true, ..a }, true));
+        assert!(history_break(Some((a,true)), a, false));
+    }
     #[test]
     fn ffx_surface_values_and_states() {
         assert_eq!(surface(28),Some(10));

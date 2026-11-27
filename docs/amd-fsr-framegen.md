@@ -139,3 +139,23 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+## Ghosting / letterbox diagnostic (history fix)
+
+The SDK already resets on swapchain re-enable. This patch also requests reset
+on the actual generation callback for title reset, FOV/projection changes,
+render-size, motion-scale, or HUD-less availability changes, and after missing
+inputs. Normal temporal jitter does not reset history. The callback logs the
+exact frame ID. The FOV threshold of 0.05 radians is a conservative heuristic,
+not true camera-cut detection.
+
+For border artifacts, the default full scene rectangle remains unchanged.
+Set VICTORY_FSR_RECT to left,top,width,height in output pixels only if the
+actual 3D viewport is known. Example for a verified 1920x800 scene centered
+within a 1920x1080 output: '0,140,1920,800'. This is not automatic letterbox
+detection; do not apply it to full-screen gameplay. VICTORY_FSR_HUDLESS=0
+is an A/B diagnostic that switches optical flow to the composed backbuffer;
+it may introduce UI artifacts, so it is not the default. Keep the same game
+settings and compare the same cutscene/scene with the diagnostic on/off.
+The native presentation meter remains unchanged. No Windows GPU validation
+has been performed.
