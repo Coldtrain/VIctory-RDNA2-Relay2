@@ -71,6 +71,30 @@ successful interpolation dispatches per second separately. A failed or first
 sample displays -- rather than assuming 2x. Without an AMD swapchain, FG OFF
 is shown. No waits, changes to the upscaler, or synthetic counters are added.
 
+## Own temporal upscaler capture (diagnostic, not FG support yet)
+
+The game's own upscaler (VICTORY_OWN_UPSCALER=1) bypasses the FidelityFX
+dispatch. The SDK still loads, but interpolation waits for inputs. Do not
+force the stock path or reuse old depth/motion. To identify the actual own
+upscaler pass, capture its resource binding and shader hashes using the
+existing diagnostic operation listing:
+
+    New-Item -ItemType Directory -Force .\fsr-own-probe | Out-Null
+    .\scripts\play.ps1 -Exe "F:\Games\GTAVI\game_scarlett_master.exe" -Console series-s -RenderScale 0.30 -Upscaler game -More @{
+        VICTORY_FSR_FRAMEGEN = '0'
+        VICTORY_FSR_CAPTURE = '0'
+        VICTORY_AFMF = '0'
+        VICTORY_CAPTURE = (Resolve-Path .\fsr-own-probe).Path
+        VICTORY_CAPTURE_WORLD = '1'
+        VICTORY_CAPTURE_WORLD_ALSO = '120'
+    }
+
+Keep the resulting frame-*-ops.txt listings (shader hashes, roots, texture
+formats and sizes). The capture adds diagnostic overhead; do not benchmark
+with it. A second stock capture at the same scene can help compare the
+depth and motion resources. No own-upscaler inputs are assumed until the
+shader binding and camera constants are verified.
+
 ## Implementation and limitations
 
 Capture is held by the host command list (including thin-list interpreter),
