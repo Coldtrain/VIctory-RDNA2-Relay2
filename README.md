@@ -2,14 +2,38 @@
 
 An independent source-snapshot fork of the CoolFox Relay 2 build, with bounded Direct3D 12 command-allocator retention to address Radeon device resets during gameplay.
 
-## Gameplay result
+## Gameplay results — November 27, 2026
+
+**AMD Radeon RX 6800 (RDNA 2): ~17–18 rendered FPS / ~35 presented FPS with native AMD FSR 3.1 Super Resolution and Frame Generation.** No DLSS or driver AFMF is needed.
+
+| Configuration | Native/rendered FPS | Presented FPS (including FG) |
+| --- | ---: | ---: |
+| Series S, 960 × 540 internal → 1920 × 1080, native FSR 3.1 SR + FG | **17.4** | **34.7** |
+| Same session, upper-end sampled performance | 29.1 | 59.2 |
+
+The averages above are arithmetic means of 959 logged presentation-meter samples with frame generation active, from Coldtrain's November 27 test of commit `b752c46`. The session lasted approximately 17 minutes 48 seconds and ended by closing the window rather than crashing. The upper-end values are individual sampled maxima, not sustained performance. The DXGI presentation meter estimates presented FPS, not physical display scanout; generated frames do not increase the game's simulation or native rendering rate. Results depend on scene, streaming and shader cache state. No universal performance or crash-free guarantee is implied.
+
+### Reproduce the native AMD test
+
+Supply the Windows AMD FidelityFX SDK 1.1.4 DLL (`amd_fidelityfx_dx12.dll`); it is not bundled. See [AMD FSR integration and limitations](docs/amd-fsr-framegen.md).
+
+```powershell
+cargo build --locked --profile diag -p victory --features diagnostics
+.\scripts\play.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe' -Console series-s -RenderScale 0.50 -Upscaler amd -More @{
+    VICTORY_FSR_FRAMEGEN='1'
+    VICTORY_FSR_SDK_DLL='D:\SDK\amd_fidelityfx_dx12.dll'
+    VICTORY_AFMF='0'
+}
+```
+
+### Historical results — November 26, 2026
 
 | Configuration | Reported result |
 | --- | --- |
-| AMD Radeon RX 6800 (RDNA 2), 4K | **~15 FPS average in gameplay** |
-| AMD Radeon RX 6800 (RDNA 2), 720p | **~20-25 FPS average in gameplay** |
+| AMD Radeon RX 6800 (RDNA 2), 4K | ~15 FPS average in gameplay |
+| AMD Radeon RX 6800 (RDNA 2), 720p | ~20–25 FPS average in gameplay |
 
-Reported by Coldtrain on the patched build on November 26, 2026. This is a user-observed result, not an independent benchmark. Internal rendering resolution, scene, frame-generation status, and test duration were not supplied. No universal performance or crash-free guarantee is implied.
+These earlier user-observed results were not independent benchmarks; internal render resolution, scene, frame-generation status and duration were not supplied. They are retained for historical context, not a controlled comparison.
 
 ## What was fixed
 
