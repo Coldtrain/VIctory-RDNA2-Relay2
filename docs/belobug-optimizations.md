@@ -25,3 +25,7 @@ First test `VICTORY_PORT_CBV=1`, `VICTORY_PORT_CBV_PLACE=0`, `VICTORY_PORT_CBV_R
 ## Sprint 4 — parallel memory guards (renderer port 6)
 
 Exact preserved source patch from `9c607ee` on Sprint 3. Enable `VICTORY_PORT_GUARD=1` to reduce global guard lock contention and parallelize refresh planning. Existing FSR, scaling, CBV, descriptor fallback and allocator behavior preserved. Original tests included; Windows compilation and runtime validation pending. Compare guard wait, protection changes, refresh planning and native FPS. Shared-memory synchronization remains experimental; disable the flag if visual regressions appear.
+
+## Optional 60 FPS timing patch
+
+Ported timing code and tests from Coldtrain/VIctory-7900XTX commit `a3e4025e5152a9e97a64afa0161fe2d194520162`. Enable with `VICTORY_FRAME_INTERVAL_MS=16.667`, `VICTORY_TITLE_FPS=60`, optionally `VICTORY_TIMER_LOG=1`. The title hash and all three instruction sites must match or execution is refused. Two title FPS loads and minimum simulation step are updated with the layer's event clock; maximum simulation step is unchanged. This raises the cap, not GPU throughput, and does not decouple simulation and render threads. Verify game speed and pacing below 30 FPS and above it. Unset both timing switches to restore stock timing. Windows compilation and gameplay validation pending.

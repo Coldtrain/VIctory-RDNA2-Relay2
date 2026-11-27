@@ -28,6 +28,7 @@ mod crash;
 pub mod descriptor_sites;
 #[cfg(windows)]
 mod hooks;
+pub mod frame_rate;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;
