@@ -196,3 +196,14 @@ This is a tree of other people's work with more on top. The upstream repository 
 
 GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
 covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+
+### Driver-based AMD Fluid Motion Frames (AFMF)
+
+Use AMD Software: Adrenalin Edition with AFMF enabled in the per-application graphics profile for the **host victory.exe**, not the Xbox title executable. Disable VSync and other frame-generation tools. The launcher switch `-AFMF` (or `VICTORY_AFMF=1`) requests DXGI fullscreen at swapchain creation and keeps Present(0). If the fullscreen request fails, the ordinary windowed path remains available. D3D12 fullscreen is managed by Windows and the driver; this does not guarantee exclusive scanout or AFMF activation. AMD's overlay (Alt+R) reports actual activation, and its performance overlay (Ctrl+Shift+O) reports driver-side FPS. VIctory's title bar reports base FPS only and directs you to AMD's overlay; driver-generated frames are not counted by the game's Present calls.
+
+```powershell
+cargo build --locked --profile diag -p victory --features diagnostics
+.\scripts\play.ps1 -Exe "F:\Games\GTAVI\game_scarlett_master.exe" -Console series-s -RenderScale 0.30 -Upscaler game -AFMF -More @{VICTORY_DISPLAY_MODE='1280x720'}
+```
+
+This is based on the graphics-settings-only branch, with no experimental FSR framegen code or SDK dependency. No driver settings are silently modified. Fullscreen behavior and AFMF activation require Windows/Radeon testing. Remove -AFMF to return to ordinary presentation (and disable AFMF in the driver profile if desired).

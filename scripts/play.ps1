@@ -3,6 +3,7 @@
 # -Console      series-x (default) or series-s (1080p reported by default)
 # -RenderScale  0 (stock) or 0.2..1.0 (internal scale)
 # -Upscaler     auto (default), game (title temporal), stock (console default)
+# -AFMF         request DXGI fullscreen for driver AFMF (enable per-app in Adrenalin)
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
@@ -13,6 +14,7 @@ param(
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [ValidateRange(0.0, 1.0)][double]$RenderScale = 0,
     [ValidateSet('auto', 'game', 'stock')][string]$Upscaler = 'auto',
+    [switch]$AFMF,
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
@@ -33,6 +35,7 @@ if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($Console -eq 'series-s') { $settings.VICTORY_DISPLAY_MODE = '1920x1080' }
 if ($RenderScale -ne 0 -and $RenderScale -lt 0.2) { throw 'RenderScale must be 0 or between 0.2 and 1.0.' }
 $settings.VICTORY_RENDER_SCALE = $RenderScale.ToString('G', [System.Globalization.CultureInfo]::InvariantCulture)
+if ($AFMF) { $settings.VICTORY_AFMF = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 # Keep the stock Series S FSR path unmodified; its custom-scale hook is experimental.
 if ($Upscaler -eq 'stock') {
@@ -51,6 +54,11 @@ if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; return }
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
 Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
+if ($settings.VICTORY_AFMF -eq '1') {
+    Write-Host 'AFMF: enable AMD Fluid Motion Frames in Adrenalin for this host executable:'
+    Write-Host (Resolve-Path $victory).Path
+    Write-Host 'Keep VSync off; use Alt+R to confirm AFMF active and Ctrl+Shift+O for AMD metrics.'
+}
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 Write-Host "Profile: $Console; display: $($settings.VICTORY_DISPLAY_MODE); render scale: $($settings.VICTORY_RENDER_SCALE); upscaler: $Upscaler; own upscaler: $($settings.VICTORY_OWN_UPSCALER)"

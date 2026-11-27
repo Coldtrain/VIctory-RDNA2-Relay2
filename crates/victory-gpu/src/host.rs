@@ -8657,6 +8657,11 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+fn afmf_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AFMF").is_some_and(|v| v == "1"))
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
@@ -8961,7 +8966,11 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let text = if afmf_requested() {
+            format!(" | VIctory Base: {fps:.0} FPS | AFMF: see AMD overlay | {ms:.1} ms/frame")
+        } else {
+            format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame")
+        };
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -9273,7 +9282,13 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let present_result = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if afmf_requested() && present_result.is_err() {
+                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(?present_result, "AFMF: host Present failed");
+                }
+            }
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
@@ -9316,6 +9331,24 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            // AFMF runs in the Radeon driver after Present. No FSR context,
+            // game motion vectors or interpolation DLL belongs here.
+            if afmf_requested() {
+                match swap_chain.SetFullscreenState(true, None::<&IDXGIOutput>) {
+                    Ok(()) => {
+                        // Required after a fullscreen transition with flip model.
+                        match swap_chain.ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0)) {
+                            Ok(()) => tracing::info!(width, height, "AFMF: DXGI fullscreen requested; VSync off; enable AFMF in Adrenalin"),
+                            Err(error) => {
+                                tracing::warn!(%error, "AFMF: fullscreen buffer resize failed; returning to windowed mode");
+                                swap_chain.SetFullscreenState(false, None::<&IDXGIOutput>)?;
+                                swap_chain.ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))?;
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "AFMF: DXGI fullscreen unavailable; using normal presentation"),
+                }
+            }
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
