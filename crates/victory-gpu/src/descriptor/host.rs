@@ -2939,8 +2939,15 @@ impl HostHeap {
     /// size, whose reads past it return zeros instead of reaching whatever
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+        // Bound the view by the actual D3D12 allocation, not only the title span.
+        let width = unsafe { buffer.GetDesc() }.Width;
+        let bytes = len.min(width.saturating_sub(offset));
+        if offset % 16 != 0 || bytes < 4 {
+            self.null_raw_at(index);
+            return;
+        }
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let elements = (bytes / 4).min(u64::from(u32::MAX)) as u32;
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -2981,8 +2988,15 @@ impl HostHeap {
     /// root UAV with a size, whose accesses past it do nothing instead of
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+        // Bound the view by the actual D3D12 allocation, not only the title span.
+        let width = unsafe { buffer.GetDesc() }.Width;
+        let bytes = len.min(width.saturating_sub(offset));
+        if offset % 16 != 0 || bytes < 4 {
+            self.null_raw_uav_at(index);
+            return;
+        }
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let elements = (bytes / 4).min(u64::from(u32::MAX)) as u32;
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
