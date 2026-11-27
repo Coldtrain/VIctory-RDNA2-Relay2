@@ -7,6 +7,7 @@ An independent source-snapshot fork of the CoolFox Relay 2 build, with bounded D
 | Configuration | Reported result |
 | --- | --- |
 | AMD Radeon RX 6800 (RDNA 2), 4K | **~15 FPS average in gameplay** |
+| AMD Radeon RX 6800 (RDNA 2), 720p | **~20 FPS average in gameplay** |
 
 Reported by Coldtrain on the patched build on November 26, 2026. This is a user-observed result, not an independent benchmark. Internal rendering resolution, scene, frame-generation status, and test duration were not supplied. No universal performance or crash-free guarantee is implied.
 
