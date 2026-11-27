@@ -3,7 +3,7 @@
 # -Console      series-x (default) or series-s (1080p reported by default)
 # -RenderScale  0 (stock) or 0.2..1.0 (internal scale)
 # -Upscaler     auto (default), game (title temporal), stock (console default)
-# -AFMF         request DXGI fullscreen for driver AFMF (enable per-app in Adrenalin)
+# -AFMF         request borderless fullscreen for driver AFMF (enable per-app in Adrenalin)
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release

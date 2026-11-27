@@ -8662,28 +8662,119 @@ fn afmf_requested() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_AFMF").is_some_and(|v| v == "1"))
 }
 
-// Window procedures must never wait for the GPU or lock the presenter.
-// Store only the requested window; consume it at a presentation boundary.
-static FULLSCREEN_TOGGLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// A borderless window covers its current monitor without a DXGI mode
+// transition, a GPU wait, or changing the title's render resolution.
+static PRESENT_WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const WM_BORDERLESS: u32 = WM_APP + 0x5a1;
 
-/// Recognize Alt+Enter on either the title window or our fallback window.
-/// Ignore key repeat and consume it without entering the system menu.
+struct WindowedMode {
+    hwnd: usize,
+    style: isize,
+    ex_style: isize,
+    placement: WINDOWPLACEMENT,
+}
+
+thread_local! {
+    static WINDOWED: std::cell::RefCell<Option<WindowedMode>> = const { std::cell::RefCell::new(None) };
+}
+
+fn restore_window(hwnd: HWND, saved: &WindowedMode) -> windows::core::Result<()> {
+    // SAFETY: called on the window's own thread, with its saved placement.
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, saved.style);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, saved.ex_style);
+        SetWindowPlacement(hwnd, &saved.placement)?;
+        SetWindowPos(hwnd, None, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+    }
+}
+
+fn borderless(hwnd: HWND, enter_only: bool) -> windows::core::Result<()> {
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    let old = WINDOWED.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.as_ref().is_some_and(|saved| saved.hwnd == hwnd.0 as usize) {
+            if enter_only { return None; }
+            s.take()
+        } else {
+            *s = None;
+            None
+        }
+    });
+    if let Some(saved) = old {
+        if let Err(error) = restore_window(hwnd, &saved) {
+            WINDOWED.with(|s| *s.borrow_mut() = Some(saved));
+            return Err(error);
+        }
+        tracing::info!(fullscreen = false, "borderless fullscreen changed");
+        return Ok(());
+    }
+    if WINDOWED.with(|s| s.borrow().is_some()) {
+        return Ok(());
+    }
+    // SAFETY: all window changes execute in its own message callback;
+    // no presenter or submission mutex is taken.
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return Err(windows::core::Error::from_win32());
+        }
+        let mut placement = WINDOWPLACEMENT { length: size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+        GetWindowPlacement(hwnd, &mut placement)?;
+        let saved = WindowedMode {
+            hwnd: hwnd.0 as usize,
+            style: GetWindowLongPtrW(hwnd, GWL_STYLE),
+            ex_style: GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
+            placement,
+        };
+        let style = (saved.style as u32 & !(WS_OVERLAPPEDWINDOW.0 | WS_MAXIMIZE.0 | WS_MINIMIZE.0)) | WS_POPUP.0;
+        let ex_style = saved.ex_style as u32 & !(WS_EX_WINDOWEDGE.0 | WS_EX_CLIENTEDGE.0 | WS_EX_DLGMODALFRAME.0 | WS_EX_STATICEDGE.0);
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style as isize);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style as isize);
+        let rect = info.rcMonitor;
+        let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+        if let Err(error) = SetWindowPos(hwnd, Some(HWND_TOP), rect.left, rect.top, width, height,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW) {
+            let _ = restore_window(hwnd, &saved);
+            return Err(error);
+        }
+        WINDOWED.with(|s| *s.borrow_mut() = Some(saved));
+        let mut client = RECT::default();
+        let _ = GetClientRect(hwnd, &mut client);
+        tracing::info!(fullscreen = true, width, height, client_width = client.right - client.left,
+            client_height = client.bottom - client.top, "borderless fullscreen changed");
+        Ok(())
+    }
+}
+
+/// Recognize Alt+Enter, then post a message to perform the window-only
+/// operation outside the key handler. Both title and fallback windows use it.
 pub fn fullscreen_key(hwnd: usize, message: u32, wparam: usize, lparam: isize) -> bool {
-    const RETURN: usize = 0x0d;
-    const ALT: isize = 1 << 29;
-    const REPEAT: isize = 1 << 30;
-    if message != WM_SYSKEYDOWN || wparam != RETURN || lparam & ALT == 0 {
+    if hwnd == 0 || PRESENT_WINDOW.load(Ordering::Acquire) != hwnd {
         return false;
     }
-    if lparam & REPEAT == 0 {
-        FULLSCREEN_TOGGLE.store(hwnd, Ordering::Release);
+    let window = HWND(hwnd as *mut _);
+    if message == WM_BORDERLESS {
+        if let Err(error) = borderless(window, wparam == 1) {
+            tracing::warn!(%error, "borderless fullscreen change failed");
+        }
+        return true;
+    }
+    if message != WM_SYSKEYDOWN || wparam != 0x0d || lparam & (1 << 29) == 0 {
+        return false;
+    }
+    if lparam & (1 << 30) == 0 {
+        // SAFETY: posts only; the window's thread performs the change.
+        if let Err(error) = unsafe { PostMessageW(Some(window), WM_BORDERLESS, WPARAM(0), LPARAM(0)) } {
+            tracing::warn!(%error, "could not post Alt+Enter");
+        }
     }
     true
 }
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
-    fullscreen_resize_pending: bool,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -9080,30 +9171,7 @@ impl Host {
                 }
             }
         }
-        // Alt+Enter is queued by the window procedure. Settle outstanding
-        // presents before changing the mode, and resize the flip-model
-        // buffers even when the title's render resolution is unchanged.
-        if FULLSCREEN_TOGGLE.compare_exchange(p.hwnd.0 as usize, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            settle_now(WHY_SYNC);
-            let mut fullscreen = windows::core::BOOL(0);
-            // SAFETY: serialized with our presents; the output pointer is ours.
-            unsafe {
-                match p.swap_chain.GetFullscreenState(Some(&mut fullscreen), None) {
-                    Ok(()) => {
-                        let wanted = !fullscreen.as_bool();
-                        match p.swap_chain.SetFullscreenState(wanted, None::<&IDXGIOutput>) {
-                            Ok(()) => {
-                                p.fullscreen_resize_pending = true;
-                                tracing::info!(fullscreen = wanted, "Alt+Enter: display mode changed");
-                            }
-                            Err(error) => tracing::warn!(%error, "Alt+Enter: display mode change refused"),
-                        }
-                    }
-                    Err(error) => tracing::warn!(%error, "Alt+Enter: could not query display mode"),
-                }
-            }
-        }
-        if p.fullscreen_resize_pending || (p.width, p.height, p.format) != (width, height, format) {
+        if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
@@ -9113,7 +9181,6 @@ impl Host {
             };
             match resized {
                 Ok(()) => {
-                    p.fullscreen_resize_pending = false;
                     if p.format != format {
                         p.composer = None;
                     }
@@ -9370,6 +9437,7 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Scaling: DXGI_SCALING_STRETCH,
                 ..Default::default()
             };
             let swap_chain = factory
@@ -9380,31 +9448,19 @@ impl Host {
             if let Err(error) = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) {
                 tracing::warn!(%error, "could not disable DXGI automatic Alt+Enter");
             }
-            // AFMF runs in the Radeon driver after Present. No FSR context,
-            // game motion vectors or interpolation DLL belongs here.
-            if afmf_requested() {
-                match swap_chain.SetFullscreenState(true, None::<&IDXGIOutput>) {
-                    Ok(()) => {
-                        // Required after a fullscreen transition with flip model.
-                        match swap_chain.ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0)) {
-                            Ok(()) => tracing::info!(width, height, "AFMF: DXGI fullscreen requested; VSync off; enable AFMF in Adrenalin"),
-                            Err(error) => {
-                                tracing::warn!(%error, "AFMF: fullscreen buffer resize failed; returning to windowed mode");
-                                swap_chain.SetFullscreenState(false, None::<&IDXGIOutput>)?;
-                                swap_chain.ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))?;
-                            }
-                        }
-                    }
-                    Err(error) => tracing::warn!(%error, "AFMF: DXGI fullscreen unavailable; using normal presentation"),
-                }
-            }
             let copy = self.new_list()?;
             copy.close();
+            PRESENT_WINDOW.store(hwnd.0 as usize, Ordering::Release);
+            if afmf_requested() {
+                // Never wait for the window thread from the presenter.
+                if let Err(error) = PostMessageW(Some(hwnd), WM_BORDERLESS, WPARAM(1), LPARAM(0)) {
+                    tracing::warn!(%error, "AFMF: could not request startup borderless fullscreen");
+                }
+            }
             tracing::info!(width, height, format = format.0, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
-                fullscreen_resize_pending: false,
                 width,
                 height,
                 format,
