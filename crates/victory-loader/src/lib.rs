@@ -26,6 +26,8 @@ mod console_insn;
 mod crash;
 #[cfg(windows)]
 pub mod descriptor_sites;
+#[cfg(windows)]
+mod hooks;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;
