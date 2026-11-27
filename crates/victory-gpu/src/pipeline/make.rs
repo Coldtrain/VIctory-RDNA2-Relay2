@@ -57,29 +57,23 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 }
 
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
-    let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
+    // The known-good 14b renderer does not discard these pipeline families.
+    // In Series S their outputs can still be consumed by later lighting
+    // passes, even when the host BVH builder is disabled. Only honor an
+    // explicit request to omit them; preserve ordinary pipeline creation.
+    static POLICY: OnceLock<(bool, bool)> = OnceLock::new();
+    let &(skip_rt, skip_activate) = POLICY.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return false;
-        }
-        // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
-        // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
-        std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0")
+        let skip_rt = !builder && std::env::var_os("VICTORY_RT_RESOLVE").is_some_and(|v| v == "0");
+        let skip_activate = std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
+        tracing::info!(skip_rt, skip_activate, "lighting pipeline policy: explicit skip only");
+        (skip_rt, skip_activate)
     });
     if skip_rt && named(shaders, b"CS_RaytracingResolve") {
-        return Some("shades ray-tracing hits without BVH, left out");
+        return Some("shades ray-tracing hits without BVH, explicitly left out");
     }
-    static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
-    let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
-        }
-        std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
-    });
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
-        return Some("ray activation shader without BVH, left out");
+        return Some("ray activation shader explicitly left out");
     }
     None
 }
