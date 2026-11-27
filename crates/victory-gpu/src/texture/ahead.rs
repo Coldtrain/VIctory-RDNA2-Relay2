@@ -182,6 +182,12 @@ pub(crate) fn listed(copy: &HostTexture) {
     }
 }
 
+/// Number of persistent upload workers. Keep the old default and bound the
+/// number of additional copy command allocators on RDNA2.
+fn upload_worker_count(value: Option<&str>) -> usize {
+    value.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(2).clamp(1, 8)
+}
+
 /// The copy queue and its threads, made on first use.
 fn workers() -> Option<&'static ID3D12CommandQueue> {
     /// Free-threaded.
@@ -203,11 +209,26 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
                     })
                     .ok()?
             };
-            for n in 0..2 {
-                let worker = Worker::new(&host.device, queue.clone()).ok()?;
-                std::thread::Builder::new().name(format!("uploads ahead {n}")).spawn(move || worker.work()).ok()?;
+            let requested = upload_worker_count(std::env::var("VICTORY_UPLOAD_WORKERS").ok().as_deref());
+            let mut workers = 0;
+            for n in 0..requested {
+                let worker = match Worker::new(&host.device, queue.clone()) {
+                    Ok(worker) => worker,
+                    Err(error) => {
+                        tracing::warn!(%error, worker = n, "could not create another texture upload worker");
+                        break;
+                    }
+                };
+                match std::thread::Builder::new().name(format!("uploads ahead {n}")).spawn(move || worker.work()) {
+                    Ok(_) => workers += 1,
+                    Err(error) => {
+                        tracing::warn!(%error, worker = n, "could not start another texture upload worker");
+                        break;
+                    }
+                }
             }
-            Some(Queue(queue))
+            tracing::info!(requested, workers, "texture upload workers (VICTORY_UPLOAD_WORKERS)");
+            (workers != 0).then_some(Queue(queue))
         })
         .as_ref()
         .map(|q| &q.0)
@@ -363,6 +384,16 @@ pub(crate) fn fresh() -> AtomicU8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_worker_count_is_bounded() {
+        assert_eq!(upload_worker_count(None), 2);
+        assert_eq!(upload_worker_count(Some("bad")), 2);
+        assert_eq!(upload_worker_count(Some("0")), 1);
+        assert_eq!(upload_worker_count(Some(" 4 ")), 4);
+        assert_eq!(upload_worker_count(Some("8")), 8);
+        assert_eq!(upload_worker_count(Some("100")), 8);
+    }
 
     /// The texels of a placed texture arrive by the copy queue, all levels of
     /// them, and what waits for them is called then; a second asking finds the
