@@ -9243,12 +9243,21 @@ impl Host {
         let planes = overlay.and_then(|(over, over_state)| {
             // SAFETY: a live overlay resource.
             let over_desc = unsafe { over.GetDesc() };
-            Some((
-                over,
-                D3D12_RESOURCE_STATES(over_state as i32),
-                crate::compose::view(&desc)?,
-                crate::compose::view(&over_desc)?,
-            ))
+            let (base_view, overlay_view) = (crate::compose::view(&desc), crate::compose::view(&over_desc));
+            static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            static REJECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    base_width = desc.Width, base_height = desc.Height, base_format = desc.Format.0,
+                    overlay_width = over_desc.Width, overlay_height = over_desc.Height, overlay_format = over_desc.Format.0,
+                    "display output: two-plane source dimensions"
+                );
+            }
+            if (base_view.is_none() || overlay_view.is_none()) && !REJECTED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(base_format = desc.Format.0, overlay_format = over_desc.Format.0,
+                    "display output: unsupported plane view; showing base plane only");
+            }
+            Some((over, D3D12_RESOURCE_STATES(over_state as i32), base_view?, overlay_view?))
         });
         let format = if planes.is_some() {
             DXGI_FORMAT_R8G8B8A8_UNORM

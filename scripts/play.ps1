@@ -1,5 +1,6 @@
 # Starts the title with the settings this fork is played with (README.md, "How to run it").
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
+# -Console      series-s (default) or series-x; Series S reports 1080p by default
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
@@ -8,6 +9,7 @@
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
+    [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s',
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
@@ -20,6 +22,17 @@ $settings = @{
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
 }
+# Start with conservative renderer settings to isolate Series S presentation.
+# All cumulative experimental ports remain available through -More.
+$settings.VICTORY_PLANES = '1'
+$settings.VICTORY_PORT_CONSTANTS = '1'
+$settings.VICTORY_PORT_DESCRIPTORS = '0'
+$settings.VICTORY_PORT_CBV = '0'
+$settings.VICTORY_PORT_CBV_PLACE = '0'
+$settings.VICTORY_PORT_CBV_RELAY2 = '0'
+$settings.VICTORY_PORT_GUARD = '0'
+$settings.VICTORY_UPLOAD_WORKERS = '2'
+if ($Console -eq 'series-s') { $settings.VICTORY_DISPLAY_MODE = '1920x1080' }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
@@ -41,7 +54,8 @@ try {
     $null = New-Item -ItemType Directory -Path $LogDirectory -Force -ErrorAction Stop
     $LogFile = Join-Path (Resolve-Path $LogDirectory).Path ("victory-{0}-{1}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss-fff'), $PID)
     Write-Host "Logging to $LogFile"
-    & $victory run $Exe --execute 2>&1 | Tee-Object -FilePath $LogFile
+    "Profile: $Console; display: $($settings.VICTORY_DISPLAY_MODE); planes: $($settings.VICTORY_PLANES)" | Tee-Object -FilePath $LogFile
+    & $victory run $Exe --execute --console $Console 2>&1 | Tee-Object -FilePath $LogFile -Append
     $code = $LASTEXITCODE
 } finally { Pop-Location }
 exit $code

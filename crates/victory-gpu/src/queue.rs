@@ -666,6 +666,26 @@ struct RetailPlane {
 #[cfg(windows)]
 const _: () = assert!(size_of::<RetailPlane>() == 72);
 
+/// Select the second plane only if composition is enabled. Log the first
+/// multi-plane present and the first missing/invalid overlay independently.
+#[cfg(windows)]
+fn selected_overlay(planes: u32, parameters: *const Plane) -> Option<This> {
+    if planes < 2 || parameters.is_null() {
+        return None;
+    }
+    let on = crate::compose::on();
+    let overlay = overlay_resource(parameters);
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    static MISSING: AtomicBool = AtomicBool::new(false);
+    if !SEEN.swap(true, Ordering::Relaxed) {
+        tracing::info!(planes, second = ?overlay, composed = on, "Series S multi-plane present (VICTORY_PLANES)");
+    }
+    if on && overlay.is_none() && !MISSING.swap(true, Ordering::Relaxed) {
+        tracing::warn!(planes, "second present plane could not be resolved; showing base plane only");
+    }
+    if on { overlay } else { None }
+}
+
 #[cfg(windows)]
 fn overlay_resource(parameters: *const Plane) -> Option<This> {
     // Read only the second prefix at the 72-byte retail PresentX stride. A
@@ -987,9 +1007,7 @@ extern "system" fn present(
             })
         };
         let texture = base_res.and_then(take_copy);
-        let overlay = (planes > 1 && !plane_parameters.is_null())
-            .then(|| overlay_resource(plane_parameters))
-            .flatten()
+        let overlay = selected_overlay(planes, plane_parameters)
             .filter(|&over_res| base_res != Some(over_res))
             .and_then(take_copy);
         let resource = texture.as_ref().map_or(0, |t| t.0);
@@ -1018,9 +1036,7 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let overlay = (planes > 1)
-            .then(|| overlay_resource(plane_parameters))
-            .flatten()
+        let overlay = selected_overlay(planes, plane_parameters)
             .filter(|&over_res| over_res != resource)
             .and_then(|over_res| {
                 crate::resource::host_resource(over_res).map(|over_tex| {

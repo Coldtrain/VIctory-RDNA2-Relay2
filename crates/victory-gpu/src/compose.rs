@@ -31,6 +31,12 @@ float4 ps(V v) : SV_Target {
 }
 "#;
 
+/// Enable the existing two-plane presenter when a second plane is supplied.
+pub(crate) fn on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLANES").is_none_or(|v| v != "0"))
+}
+
 pub(crate) struct Composer {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
