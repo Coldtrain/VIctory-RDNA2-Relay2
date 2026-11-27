@@ -24,94 +24,6 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
-/// Shader interface metadata shared by every pipeline variant and draw.
-pub(crate) struct TablePlan {
-    groups: Vec<TableGroup>,
-    // Direct entries can interleave slots. Preserve their declaration order
-    // when recording resource reads, writes, and transitions.
-    direct: Vec<(usize, usize)>,
-}
-
-struct TableGroup {
-    slot: u8,
-    has_cbv: bool,
-    has_uav: bool,
-    max_dword: u32,
-    entries: Vec<UsedResource>,
-    indexed: Vec<RootIndexedView>,
-    // Descriptor number -> first declaration, matching the bind-time search.
-    by_descriptor: Vec<(u32, usize)>,
-}
-
-impl TablePlan {
-    pub(crate) fn new(used: &[UsedResource], indexed: &[RootIndexedView]) -> Self {
-        let mut slots: Vec<_> = used
-            .iter()
-            .filter(|u| u.root == RootType::Table)
-            .map(|u| u.slot)
-            .collect();
-        slots.sort_unstable();
-        slots.dedup();
-        let mut groups: Vec<_> = slots
-            .iter()
-            .map(|&slot| TableGroup {
-                slot,
-                has_cbv: false,
-                has_uav: false,
-                max_dword: 0,
-                entries: Vec::new(),
-                by_descriptor: Vec::new(),
-                indexed: indexed.iter().filter(|v| v.table_slot == slot).copied().collect(),
-            })
-            .collect();
-        let mut direct = Vec::new();
-        for &u in used.iter().filter(|u| u.root == RootType::Table) {
-            let i = slots
-                .binary_search(&u.slot)
-                .expect("table slot collected from these declarations");
-            let group = &mut groups[i];
-            group.has_cbv |= u.kind == ResourceType::Cbv;
-            group.has_uav |= u.kind == ResourceType::Uav;
-            group.max_dword = group.max_dword.max(u.table_offset_dwords);
-            direct.push((i, group.entries.len()));
-            group
-                .by_descriptor
-                .push((u.table_offset_dwords / 8, group.entries.len()));
-            group.entries.push(u);
-        }
-        for group in &mut groups {
-            group.by_descriptor.sort_unstable();
-            group.by_descriptor.dedup_by_key(|item| item.0);
-        }
-        Self { groups, direct }
-    }
-}
-
-impl TableGroup {
-    fn entry(&self, descriptor: u32) -> Option<&UsedResource> {
-        let i = self
-            .by_descriptor
-            .binary_search_by_key(&descriptor, |item| item.0)
-            .ok()?;
-        Some(&self.entries[self.by_descriptor[i].1])
-    }
-
-    fn needs_snapshot(&self, heap: &crate::descriptor::Heap, host_count: u32, table: u64) -> bool {
-        let index_at = |dword: u32| {
-            table
-                .checked_add(u64::from(dword) * 4)
-                .and_then(|end| heap.index(end))
-        };
-        match index_at(self.max_dword) {
-            Some(i) => i >= host_count,
-            None => self
-                .entries
-                .iter()
-                .any(|u| index_at(u.table_offset_dwords).is_some_and(|i| i >= host_count)),
-        }
-    }
-}
-
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -1643,7 +1555,7 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.tables, compute);
+            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -3628,41 +3540,55 @@ impl State {
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
-        plan: &TablePlan,
+        used: &[UsedResource],
+        indexed: &[RootIndexedView],
         compute: bool,
     ) -> Few<(u8, u32), 16> {
-        let mut fresh = [0u64; 4];
-        let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
-        for group in &plan.groups {
-            let slot = group.slot;
-            let needs_snapshot = group.has_cbv
-                || match self.roots_ref(compute).get(usize::from(slot)) {
-                    Some(&Root::Table(table)) => self.heap_of(table).is_some_and(|heap| {
-                        heap.host()
-                            .is_some_and(|host| group.needs_snapshot(heap, host.count(), table))
-                    }),
-                    _ => false,
-                };
-            if needs_snapshot {
-                fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
+        let tables = |u: &&UsedResource| u.root == RootType::Table;
+        let mut fresh: Few<u8, 16> = Few::default();
+        for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
+            if !fresh.contains(&u.slot) {
+                fresh.push(u.slot);
             }
         }
-        for &(g, e) in &plan.direct {
-            let group = &plan.groups[g];
-            if !selected_slot(&fresh, group.slot) {
-                self.table_entry(list, &group.entries[e], compute);
+        // Tables reaching past a host heap smaller than the title's (the
+        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
+        // title's slots there have no host slot of their own.
+        for u in used.iter().filter(tables) {
+            if fresh.contains(&u.slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                continue;
+            };
+            let end = table + u64::from(u.table_offset_dwords) * 4;
+            let Some(heap) = self.heap_of(table) else {
+                continue;
+            };
+            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
+                continue;
+            };
+            if index >= host.count() {
+                fresh.push(u.slot);
+            }
+        }
+        fresh.sort_unstable();
+        for u in used.iter().filter(tables) {
+            if !fresh.contains(&u.slot) {
+                self.table_entry(list, u, compute);
             }
         }
         let mut made = Few::default();
-        for group in &plan.groups {
-            let slot = group.slot;
-            if !selected_slot(&fresh, slot) {
-                continue;
-            }
+        for &slot in fresh.iter() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries = &group.entries;
+            // (Their places among `used`.)
+            let mut places: Few<u16, 32> = Few::default();
+            for (i, _) in used.iter().enumerate().filter(|(_, u)| tables(u) && u.slot == slot) {
+                places.push(i as u16);
+            }
+            let entries = || places.iter().map(|&i| &used[usize::from(i)]);
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -3672,9 +3598,9 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = group
-                .indexed
+            let mut selected: Vec<u32> = indexed
                 .iter()
+                .filter(|index| index.table_slot == slot)
                 .map(|index| {
                     let constant = self.user_value(
                         compute,
@@ -3688,7 +3614,12 @@ impl State {
                 .collect();
             selected.sort_unstable();
             selected.dedup();
-            let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
+            let n = entries()
+                .map(|u| u.table_offset_dwords / 8)
+                .chain(selected.last().copied())
+                .max()
+                .unwrap_or(0)
+                + 1;
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
@@ -3707,12 +3638,12 @@ impl State {
                 (table, n, h.0)
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
-            let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
+            let reader = (used.as_ptr() as usize, used.len(), STORES.get(), TESTED_DEPTH.get().0);
             if let Some(known) = self.fresh_tables.get_mut(&key) {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
-                let once = ready_once() && selected.is_empty() && !group.has_uav;
+                let once = ready_once() && selected.is_empty() && entries().all(|u| u.kind != ResourceType::Uav);
                 if once
                     && known.epoch == list.epoch()
                     && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
@@ -3725,14 +3656,14 @@ impl State {
                 }
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
                     }
                 }
                 for k in selected {
-                    if group.entry(k).is_some() {
+                    if entries().any(|u| u.table_offset_dwords / 8 == k) {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -3778,7 +3709,7 @@ impl State {
             // which may lie over slots shaders pick by index, only the ones
             // the shader names.)
             if let Some(title) = title_first {
-                for k in (0..n).filter(|&k| n <= 64 || group.entry(k).is_some()) {
+                for k in (0..n).filter(|&k| n <= 64 || entries().any(|u| u.table_offset_dwords / 8 == k)) {
                     host.slot_tabled(title + k);
                 }
             }
@@ -3798,8 +3729,8 @@ impl State {
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
-                    let kind = group
-                        .entry(k)
+                    let kind = entries()
+                        .find(|u| u.table_offset_dwords / 8 == k)
                         .map(|u| u.kind)
                         .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
                     let was = (listed.ready, listed.tabled);
@@ -3835,7 +3766,7 @@ impl State {
                     }
                     continue;
                 }
-                let used = group.entry(k);
+                let used = entries().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         // Renderer port 5: title memory in place is the
