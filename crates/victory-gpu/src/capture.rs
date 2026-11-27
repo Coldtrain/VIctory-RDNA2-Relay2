@@ -361,9 +361,16 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
 
+/// Metadata-only frame generation input discovery. Use explicit listed frames
+/// rather than tracking all frames during ordinary play.
+fn fsr_inputs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_FSR_INPUTS"))
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() || !(dump_on() || fsr_inputs()) || !listed(crate::queue::presented() + 1) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
@@ -384,6 +391,22 @@ pub(crate) fn dump_targets(frame: u64) {
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
         if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+            continue;
+        }
+        if fsr_inputs() {
+            let depth = d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+                || matches!(d.Format.0, 19..=22 | 39..=47 | 53..=56);
+            let motion = matches!(d.Format.0, 15 | 16 | 33..=38);
+            if depth || motion {
+                tracing::info!(frame, index = i, resource = format_args!("{resource:#x}"),
+                    width = d.Width, height = d.Height, format = d.Format.0,
+                    mip_levels = d.MipLevels, slices = d.DepthOrArraySize,
+                    flags = d.Flags.0, state = copy.state.load(Relaxed),
+                    depth_candidate = depth, motion_candidate = motion,
+                    "FSR frame generation input candidate (not validated)");
+            }
+        }
+        if !dump_on() {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.

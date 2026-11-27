@@ -89,6 +89,38 @@ DLL entry point. See https://lsfg-vk.dev/ and
 https://github.com/56TR/lsfg-vk-windows for the Vulkan approach.
 No proprietary DLL or shaders are bundled.
 
+### AMD FSR 3.1 frame generation groundwork
+
+This branch inherits the scene-plane preview branch. It adds a standalone
+FidelityFX 1.1.4 context creation/destruction smoke test on an AMD D3D12 adapter
+and optional render-target discovery in VIctory. It does **not** generate
+frames or modify the game's upscaler, swapchain or renderer.
+
+Obtain AMD's official [FidelityFX SDK v1.1.4](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases/tag/v1.1.4) source headers and matching `amd_fidelityfx_dx12.dll`.
+In x64 Visual Studio Developer PowerShell, run:
+
+```powershell
+.\scripts\test-fsr31-sdk.ps1 -SdkRoot 'C:\SDK\FidelityFX-SDK-1.1.4' -Dll 'C:\SDK\bin\amd_fidelityfx_dx12.dll'
+```
+
+Then build the diagnostic profile as usual and discover candidate game resources:
+
+```powershell
+.\scripts\play.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe' -Console series-s -Upscaler stock -More @{VICTORY_FSR_INPUTS='1'; VICTORY_CAPTURE_FRAMES='300,600,900'}
+```
+
+Select actual in-world frame numbers if the example frames occur in menus.
+Look for `FSR frame generation input candidate (not validated)` in logs.
+Resource format and size are only hints; verify candidate semantics, producer
+passes, jitter, vector units/direction, depth convention, camera parameters
+and frame delta before dispatching FSR. For visual confirmation, existing
+`VICTORY_CAPTURE` and `VICTORY_DUMP_TARGETS` can dump targets on the listed
+frames (slow readbacks; do not benchmark with these enabled).
+
+Future dispatch must use verified depth/motion vectors and HUD-less color,
+and retain the original HUD for both real and generated presents. Do not
+enable any hypothetical `VICTORY_FSR_FRAMEGEN` toggle: it is not implemented.
+
 The launcher clears most inherited `VICTORY_*` environment variables, so use `-More` for overrides. These are recommended reproduction settings, not a verified record of the exact 15 FPS run. See the upstream instructions below for other launch options, cache configuration and known limitations.
 
 ## Source and credits
