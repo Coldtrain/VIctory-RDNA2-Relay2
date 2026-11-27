@@ -29,7 +29,18 @@ float4 ps(V v) : SV_Target {
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
     return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
 }
+// Diagnostic only: inspect exactly the sampled scene before HUD composition.
+// Keep the normal target, viewport, queue and present path.
+[RootSignature(RS)]
+float4 ps_scene(V v) : SV_Target {
+    return float4(scene.SampleLevel(smooth_, v.uv, 0).rgb, 1);
+}
 "#;
+
+// Read once at compositor creation; the regular shader remains the default.
+fn scene_preview() -> bool {
+    std::env::var_os("VICTORY_FRAMEGEN_SCENE_PREVIEW").is_some_and(|v| v == "1")
+}
 
 pub(crate) struct Composer {
     root: ID3D12RootSignature,
@@ -66,9 +77,13 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
 
 impl Composer {
     pub(crate) fn new(host: &Host, format: DXGI_FORMAT) -> windows::core::Result<Self> {
+        let preview = scene_preview();
+        if preview {
+            tracing::warn!("framegen diagnostic: scene plane only; HUD hidden; no interpolation is active");
+        }
         let (vs, ps) = (
             compile(s!("vs"), s!("vs_5_1"))?,
-            compile(s!("ps"), s!("ps_5_1"))?,
+            compile(if preview { s!("ps_scene") } else { s!("ps") }, s!("ps_5_1"))?,
         );
         // SAFETY: the blobs' own bytes, alive through the calls.
         unsafe {

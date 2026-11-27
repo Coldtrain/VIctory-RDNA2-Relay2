@@ -61,6 +61,34 @@ the title's own temporal upscaler; auto selects it when custom scale is set.
 The hooks only apply to the known 1.0.2.1 executable hash and expected bytes.
 Keep all other launch overrides and cache conditions consistent when comparing.
 
+### Scene-only frame generation preparation (experimental)
+
+This branch adds a diagnostic mode, **not a frame generation backend**. The
+existing two-plane composer samples the 3D scene but skips the HUD blend.
+The ordinary presenter, resource states, descriptor lifetimes, frame pacing
+and game simulation are unchanged. Enable with:
+
+```powershell
+.\scripts\play.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe' -Console series-s -Upscaler stock -More @{VICTORY_FRAMEGEN_SCENE_PREVIEW='1'}
+```
+
+Wait for the two-plane present log and the warning
+`framegen diagnostic: scene plane only; HUD hidden; no interpolation is active`.
+Check that the scene remains visible and the overlay is absent. If the title
+presents a single plane, this switch has no effect. Omit the variable (or set
+it to 0) to restore normal composition. The switch is read when the composer
+is created. Do not interpret the preview as a HUD-preserving framegen result.
+
+A complete LSFG backend still needs a verified texture-in/texture-out
+interface (e.g. a compatible LSFG Vulkan compute backend with Windows
+D3D12/Vulkan external memory and fence interop), persistent scene history,
+generated-frame scheduling, UI lifetime handling and composition after each
+generated frame. The Windows Lossless application captures the completed
+window, so it cannot simply be fed the two D3D12 textures via a documented
+DLL entry point. See https://lsfg-vk.dev/ and
+https://github.com/56TR/lsfg-vk-windows for the Vulkan approach.
+No proprietary DLL or shaders are bundled.
+
 The launcher clears most inherited `VICTORY_*` environment variables, so use `-More` for overrides. These are recommended reproduction settings, not a verified record of the exact 15 FPS run. See the upstream instructions below for other launch options, cache configuration and known limitations.
 
 ## Source and credits
