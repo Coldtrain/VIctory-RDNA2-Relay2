@@ -278,7 +278,7 @@ impl Backend {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(&mut self, device: &ID3D12Device, swap: &IDXGISwapChain3, copy: &HostList,
         captured: Option<Captured>, scene: &ID3D12Resource, scene_state: u32, composed: bool,
-        display: [u32; 2], format: DXGI_FORMAT) {
+        display_size: [u32; 2], format: DXGI_FORMAT) {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         if self.faulted || FAILED_CALLBACKS.load(Ordering::Relaxed) != 0 {
@@ -294,7 +294,7 @@ impl Backend {
         let m = input.meta;
         // The title's shipping FidelityFX path only accepts its Series S
         // resolutions. Start with SDR 1080p; no image patch or fake upscaling.
-        if display != [1920,1080] || m.output != display || m.reset ||
+        if display_size != [1920,1080] || m.output != display_size || m.reset ||
             m.max_render.contains(&0) || m.render.contains(&0) ||
             m.render.iter().zip(m.max_render).any(|(&a,b)| a > b) ||
             !matches!(format.0, 28 | 87) ||
@@ -303,7 +303,7 @@ impl Backend {
             m.near.min(m.far) <= 0.0 || m.near == m.far || !(0.0..std::f32::consts::PI).contains(&m.fov) {
             static INVALID: std::sync::Once = std::sync::Once::new();
             if !m.reset {
-                INVALID.call_once(|| tracing::warn!(?m, ?display, format=format.0,
+                INVALID.call_once(|| tracing::warn!(?m, ?display_size, format=format.0,
                     "FSR FG: unsupported display/camera/render configuration"));
             }
             self.disable(swap,id);
@@ -317,7 +317,7 @@ impl Backend {
             });
             self.disable(swap,id); return;
         };
-        let motion_size = if m.flags & 2 != 0 { display } else { m.render };
+        let motion_size = if m.flags & 2 != 0 { display_size } else { m.render };
         if depth.desc[2] < m.render[0] || depth.desc[3] < m.render[1] ||
             motion.desc[2] < motion_size[0] || motion.desc[3] < motion_size[1] ||
             legal_state(&input.depth.texture,0x40) != 0x40 || legal_state(&input.motion.texture,0x40) != 0x40 {
@@ -326,7 +326,7 @@ impl Backend {
                 "FSR FG: native depth/motion dimensions or shader-read state invalid"));
             self.disable(swap,id); return;
         }
-        let key = Key { display, max_render: m.max_render, flags: m.flags & (2|4|8|16),
+        let key = Key { display: display_size, max_render: m.max_render, flags: m.flags & (2|4|8|16),
             format: surface(format.0).expect("checked SDR format") };
         if !self.ensure_frame(device,key) { self.disable(swap,id); return; }
         // On Series S the first plane excludes the separate premultiplied
@@ -334,7 +334,7 @@ impl Backend {
         // dimensions and SDK-representable resource state.
         let hudless = if composed {
             ffx_state(scene_state).and_then(|state| resource(scene,state))
-                .filter(|r| r.desc[1] == key.format && [r.desc[2],r.desc[3]] == display)
+                .filter(|r| r.desc[1] == key.format && [r.desc[2],r.desc[3]] == display_size)
         } else { None };
         if self.hudless.len() >= 8 && !self.wait() {
             self.faulted = true; self.disable(swap,id); return;
@@ -372,7 +372,7 @@ impl Backend {
         self.prepared += 1;
         if self.prepared == 1 || self.prepared % 120 == 0 {
             tracing::info!(id, prepared=self.prepared, generated_dispatches=CALLBACKS.load(Ordering::Relaxed),
-                render=?m.render, display=?display, hudless=hudless.is_some(), "FSR FG: prepared frame");
+                render=?m.render, display_size=?display_size, hudless=hudless.is_some(), "FSR FG: prepared frame");
         }
     }
 }
