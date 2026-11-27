@@ -8890,6 +8890,7 @@ impl Meter {
         );
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
+        crate::port_cbv::log(frames);
         late_line(frames);
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
