@@ -31,7 +31,7 @@ pub(crate) struct Captured {
 
 pub fn requested() -> bool {
     static ASKED: OnceLock<bool> = OnceLock::new();
-    *ASKED.get_or_init(|| ["VICTORY_FSR_FRAMEGEN", "VICTORY_FSR_CAPTURE"].iter()
+    *ASKED.get_or_init(|| ["VICTORY_FSR_FRAMEGEN", "VICTORY_FSR_CAPTURE", "VICTORY_FSR_UPSCALER"].iter()
         .any(|k| std::env::var_os(k).is_some_and(|v| v == "1")))
 }
 
@@ -64,6 +64,43 @@ pub(crate) fn submitted(input: Captured) {
 pub(crate) fn take_latest() -> Option<Captured> {
     LATEST.lock().unwrap_or_else(|e| e.into_inner()).take()
         .filter(|input| input.active.load(Ordering::Acquire))
+}
+
+/// Native FSR 3.1 upscaling is opt-in, separate from frame generation.
+pub fn upscaling() -> bool {
+    std::env::var_os("VICTORY_FSR_UPSCALER").is_some_and(|v| v == "1")
+}
+pub fn sdk_ready() -> bool { native::sdk_ready() }
+
+/// The context is independent of the Xbox context used for title bookkeeping.
+pub use native::Upscaler;
+pub fn make_upscaler(flags: u32, render: [u32; 2], output: [u32; 2]) -> Option<Arc<Upscaler>> {
+    native::make_upscaler(flags, render, output)
+}
+/// Only the four context-independent, ABI-matched queries are redirected.
+pub unsafe fn upscale_query(desc: *mut std::ffi::c_void) -> Option<u32> {
+    unsafe { native::upscale_query(desc) }
+}
+
+/// Owned input description, suitable for the thin translation stream.
+/// The title's resource objects follow the same lifetime contract as its
+/// normal command lists; the host retains their native textures on use.
+pub struct UpscaleWork {
+    pub context: Arc<Upscaler>,
+    pub resources: [usize; 7],
+    pub meta: FrameMeta,
+    pub sharpening: bool,
+    pub sharpness: f32,
+    pub pre_exposure: f32,
+    pub dispatch_flags: u32,
+    pub active: Arc<AtomicBool>,
+}
+pub fn upscale(list: *const Object, work: UpscaleWork) -> bool {
+    if list.is_null() || !native::validate_upscale(&work) { return false; }
+    crate::list::record_fsr_upscale(list, work)
+}
+pub(crate) fn execute_upscale(list: &crate::host::HostList, work: UpscaleWork) {
+    native::execute_upscale(list, work);
 }
 
 mod native;

@@ -13,7 +13,7 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [ValidateRange(0.0, 1.0)][double]$RenderScale = 0,
-    [ValidateSet('auto', 'game', 'stock')][string]$Upscaler = 'auto',
+    [ValidateSet('auto', 'game', 'stock', 'amd')][string]$Upscaler = 'auto',
     [switch]$AFMF,
     [switch]$Safe,
     [switch]$RayTracing,
@@ -39,7 +39,20 @@ if ($AFMF) { $settings.VICTORY_AFMF = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 # Stock with explicit scale opts into the separate Foxhound sizing port.
 # Scale zero keeps the shipping Series S path untouched.
-if ($Upscaler -eq 'stock') {
+if ($Upscaler -eq 'amd') {
+    if ($Console -ne 'series-s') { throw 'Native AMD upscaling test requires Series S.' }
+    if ($settings.VICTORY_DISPLAY_MODE -ne '1920x1080') { throw 'Native AMD upscaling test requires 1080p output.' }
+    if ($settings.VICTORY_RENDER_SCALE -ne '0' -and $settings.VICTORY_RENDER_SCALE -ne '0.5') {
+        throw 'First native AMD test supports stock sizing (0) or 0.50 only.'
+    }
+    if (-not $settings.VICTORY_FSR_SDK_DLL -or -not (Test-Path $settings.VICTORY_FSR_SDK_DLL)) {
+        throw 'Supply VICTORY_FSR_SDK_DLL in -More.'
+    }
+    $settings.VICTORY_OWN_UPSCALER = '0'
+    $settings.VICTORY_FSR_UPSCALER = '1'
+    $settings.VICTORY_FSR_STOCK_SIZING = if ($settings.VICTORY_RENDER_SCALE -eq '0') { '0' } else { '1' }
+    $settings.VICTORY_AFMF = '0'
+} elseif ($Upscaler -eq 'stock') {
     $settings.VICTORY_OWN_UPSCALER = '0'
     if ($settings.VICTORY_RENDER_SCALE -ne '0') {
         if ($Console -ne 'series-s') { throw 'Experimental stock sizing is only intended for Series S.' }

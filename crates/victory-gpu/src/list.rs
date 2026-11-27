@@ -171,6 +171,27 @@ pub(crate) fn record_fsr(this: This, input: crate::fsr_framegen::Captured) {
     if let Some(host) = host_list(this) { host.note_fsr(input); }
 }
 
+/// Record native FSR work in the same stream position as the Xbox call.
+#[cfg(windows)]
+pub(crate) fn record_fsr_upscale(this: This, work: crate::fsr_framegen::UpscaleWork) -> bool {
+    if this.is_null() { return false; }
+    let work = match thin::put_fsr_upscale(this,work) {
+        Ok(()) => return true,
+        Err(work) => work,
+    };
+    if host_list(this).is_none() { return false; }
+    run_fsr_upscale(this,work);
+    true
+}
+#[cfg(windows)]
+fn run_fsr_upscale(this: This, work: crate::fsr_framegen::UpscaleWork) {
+    with_state(this, |host,state| {
+        crate::fsr_framegen::execute_upscale(host,work);
+        // SDK changed the root signature, PSO and descriptor heaps.
+        state.replay(host);
+    });
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.

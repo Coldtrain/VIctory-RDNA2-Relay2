@@ -3,7 +3,8 @@
 //! ffx_api.h, ffx_api_types.h, ffx_framegeneration.h, dx12/ffx_api_dx12.h.
 //! Copyright (C) 2024 Advanced Micro Devices, Inc. See docs/amd-fsr-framegen.md.
 //! The SDK is supplied by the user, never loaded from the current directory.
-use super::Captured;
+use super::{Captured, UpscaleWork};
+use std::sync::{Arc, Mutex};
 use crate::host::{HostList, legal_state};
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
@@ -79,7 +80,7 @@ const _: () = {
 type Create = unsafe extern "C" fn(*mut Context, *mut Header, *const c_void) -> u32;
 type Destroy = unsafe extern "C" fn(*mut Context, *const c_void) -> u32;
 type Call = unsafe extern "C" fn(*mut Context, *const Header) -> u32;
-struct Api { create: Create, destroy: Destroy, configure: Call, dispatch: Call, _module: usize }
+struct Api { create: Create, destroy: Destroy, configure: Call, dispatch: Call, query: Call, _module: usize }
 static API: OnceLock<Option<Api>> = OnceLock::new();
 static CALLBACKS: AtomicU64 = AtomicU64::new(0);
 static FAILED_CALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -105,7 +106,7 @@ fn load() -> Result<Api, String> {
         .map(|f| f as *const c_void).ok_or_else(|| format!("missing SDK export {}", name.to_string_lossy()));
     macro_rules! get { ($name:literal, $t:ty) => { unsafe { std::mem::transmute::<*const c_void, $t>(find($name)?) } }; }
     let a = Api { create: get!(c"ffxCreateContext", Create), destroy: get!(c"ffxDestroyContext", Destroy),
-        configure: get!(c"ffxConfigure", Call), dispatch: get!(c"ffxDispatch", Call), _module: module as usize };
+        configure: get!(c"ffxConfigure", Call), dispatch: get!(c"ffxDispatch", Call), query: get!(c"ffxQuery", Call), _module: module as usize };
     // Keep SDK DLL loaded for the host process, including the SDK presentation threads.
     tracing::info!(path = %path.display(), "FSR FG: loaded native AMD FidelityFX SDK");
     Ok(a)
@@ -119,7 +120,8 @@ fn surface(dxgi: i32) -> Option<u32> {
         33 => 33, 34 => 18, 36 => 19,
         39 => 37, 44 | 45 | 46 => 8, 53 => 34, 54 => 21, 55 | 56 => 23,
         27 => 9, 28 => 10, 29 => 12, 87 => 14, 90 => 13, 91 => 15,
-        24 => 17, 26 => 16, 15 => 31,
+        24 => 17, 26 => 16, 15 => 31, 9 => 30, 42 => 8, 49 => 26,
+        57 => 22, 60 => 35, 61 => 25, 62 => 7, 67 => 29, 48 => 36,
         _ => return None,
     })
 }
@@ -136,6 +138,182 @@ fn ffx_state(state: u32) -> Option<u32> {
     Some(match state { 0 => 1, 8 => 2, 0x40 => 4, 0x80 => 8, 0xc0 => 12,
         0x800 => 16, 0x400 => 32, 4 => 256, _ => return None })
 }
+// FSR 3.1 native upscaler, ABI from FidelityFX SDK 1.1.4 ffx_upscale.h.
+#[repr(C)]
+struct CreateUpscale {
+    header: Header, flags: u32, max_render: [u32; 2], max_output: [u32; 2], message: usize,
+}
+#[repr(C)]
+struct DispatchUpscale {
+    header: Header, list: *mut c_void, resources: [Resource; 7],
+    jitter: [f32; 2], motion_scale: [f32; 2], render: [u32; 2], output: [u32; 2],
+    sharpening: bool, sharpness: f32, frame_ms: f32, pre_exposure: f32,
+    reset: bool, near: f32, far: f32, fov: f32, meters: f32, flags: u32,
+}
+const _: () = {
+    assert!(size_of::<CreateUpscale>() == 0x30);
+    assert!(size_of::<DispatchUpscale>() == 0x1b0);
+    assert!(offset_of!(DispatchUpscale, resources) == 0x18);
+    assert!(offset_of!(DispatchUpscale, jitter) == 0x168);
+    assert!(offset_of!(DispatchUpscale, render) == 0x178);
+    assert!(offset_of!(DispatchUpscale, reset) == 0x198);
+    assert!(offset_of!(DispatchUpscale, flags) == 0x1ac);
+};
+
+pub struct Upscaler {
+    ctx: Mutex<Context>,
+    render: [u32; 2],
+    output: [u32; 2],
+    flags: u32,
+    recorded: AtomicU64,
+    faulted: std::sync::atomic::AtomicBool,
+}
+// Retain contexts for the process lifetime: a title destroy can precede
+// translation or completion of lists that used this context. Do not destroy
+// SDK GPU allocations while those lists are still live. Bounded first test;
+// future work should retire them behind the host completion fence.
+static UPSCALERS: Mutex<Vec<Arc<Upscaler>>> = Mutex::new(Vec::new());
+
+pub(super) fn sdk_ready() -> bool { api().is_some() }
+
+pub(super) unsafe fn upscale_query(desc: *mut c_void) -> Option<u32> {
+    if desc.is_null() { return None; }
+    let header = desc.cast::<Header>();
+    if !matches!(unsafe { (*header).kind }, 0x10002..=0x10005) ||
+       !unsafe { (*header).next }.is_null() { return None; }
+    let api = api()?;
+    // These four queries are context-independent in the SDK provider.
+    Some(unsafe { (api.query)(std::ptr::null_mut(), header) })
+}
+
+pub(super) fn make_upscaler(flags: u32, render: [u32; 2], output: [u32; 2]) -> Option<Arc<Upscaler>> {
+    if render.contains(&0) || output.contains(&0) || output != [1920, 1080] ||
+       render.iter().zip(output).any(|(&a,b)| a > b) {
+        tracing::error!(?render, ?output, "FSR SR: unsupported context dimensions (initial test is 1080p output)");
+        return None;
+    }
+    let api = api()?;
+    let host = crate::host::host()?;
+    let flags = flags & 0x1ff;
+    let mut kept = UPSCALERS.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.len() >= 8 {
+        tracing::error!("FSR SR: context retention limit reached; restart the process");
+        return None;
+    }
+    let mut backend = DeviceDesc { header: Header::new(2), device: host.device.as_raw() };
+    let mut create = CreateUpscale { header: Header::new(0x10000), flags,
+        max_render: render, max_output: output, message: 0 };
+    create.header.next = &mut backend.header;
+    let mut ctx = 0;
+    let code = unsafe { (api.create)(&mut ctx, &mut create.header, std::ptr::null()) };
+    if code != 0 || ctx == 0 {
+        tracing::error!(code, ?render, ?output, flags, "FSR SR: native context creation failed");
+        if ctx != 0 { unsafe { (api.destroy)(&mut ctx, std::ptr::null()) }; }
+        return None;
+    }
+    let up = Arc::new(Upscaler { ctx: Mutex::new(ctx), render, output, flags,
+        recorded: AtomicU64::new(0), faulted: std::sync::atomic::AtomicBool::new(false) });
+    kept.push(up.clone());
+    tracing::info!(?render, ?output, flags, "FSR SR: native AMD upscaler context created");
+    Some(up)
+}
+
+fn used(work: &UpscaleWork, i: usize) -> bool {
+    work.resources[i] != 0 && (i != 3 || work.context.flags & 32 == 0)
+}
+
+pub(super) fn validate_upscale(work: &UpscaleWork) -> bool {
+    let m = work.meta;
+    if work.context.faulted.load(Ordering::Acquire) ||
+       m.render.contains(&0) || m.output.contains(&0) ||
+       m.render.iter().zip(work.context.render).any(|(&a,b)| a > b) ||
+       m.output != work.context.output ||
+       !m.jitter.iter().chain(m.motion_scale.iter()).all(|v| v.is_finite()) ||
+       !m.near.is_finite() || !m.far.is_finite() || m.near.min(m.far) <= 0.0 ||
+       m.near == m.far || !(0.0..std::f32::consts::PI).contains(&m.fov) {
+        tracing::error!(?m, "FSR SR: invalid upscale metadata or context fault");
+        return false;
+    }
+    for i in 0..7 {
+        if !used(work,i) {
+            if matches!(i,0|1|2|6) { return false; }
+            continue;
+        }
+        let r = work.resources[i] as crate::object::This;
+        if !crate::resource::is_resource(r) { return false; }
+        let Some(t) = crate::resource::host_copy(r) else { return false; };
+        let wanted = if i == 6 { 8 } else { 0x40 };
+        let Some(native) = resource(&t.texture, if i == 6 { 2 } else { 4 }) else {
+            tracing::error!(i, format=unsafe { t.texture.GetDesc() }.Format.0, "FSR SR: unsupported resource format");
+            return false;
+        };
+        let need = match i { 6 => m.output, 3 => [1,1], 2 if m.flags & 2 != 0 => m.output, _ => m.render };
+        if native.desc[2] < need[0] || native.desc[3] < need[1] ||
+           legal_state(&t.texture,wanted) != wanted {
+            tracing::error!(i, desc=?native.desc, ?need, wanted, "FSR SR: invalid resource extent or state");
+            return false;
+        }
+    }
+    true
+}
+
+pub(super) fn execute_upscale(host: &HostList, work: UpscaleWork) {
+    let up = &work.context;
+    let fail = |why: &str| {
+        up.faulted.store(true, Ordering::Release);
+        tracing::error!(%why, "FSR SR: native dispatch failed; output not updated; no unsafe Xbox fallback");
+    };
+    if up.faulted.load(Ordering::Acquire) { return; }
+    let Some(api) = api() else { fail("SDK unavailable"); return; };
+    let mut resources = [Resource::empty(); 7];
+    let mut copies: [Option<Arc<crate::resource::HostTexture>>;7] = Default::default();
+    for i in 0..7 {
+        if !used(&work,i) { continue; }
+        let r = work.resources[i] as crate::object::This;
+        // Same alias/upload/twin preparation used by Foxhound external.rs
+        // (from DexNom, GPL-3.0-or-later).
+        let Some(t) = crate::resource::host_copy(r) else { fail("missing host resource"); return; };
+        if i != 6 {
+            let aliased = crate::resource::alias_of(r).is_some_and(|source| crate::texture::alias(host,r,source));
+            if !aliased && crate::texture::title_written(&t.texture) {
+                crate::texture::upload_from(host,r,0);
+            }
+            host.twin_use(r,false,false);
+        }
+        let state = if i == 6 { 8 } else { 0x40 };
+        let Some(native) = resource(&t.texture, if i == 6 { 2 } else { 4 }) else { fail("unsupported format"); return; };
+        if legal_state(&t.texture,state) != state { fail("illegal host state"); return; }
+        host.settle(&t,state);
+        resources[i] = native;
+        copies[i] = Some(t);
+    }
+    let m = work.meta;
+    let mut ctx = up.ctx.lock().unwrap_or_else(|e| e.into_inner());
+    if up.faulted.load(Ordering::Acquire) { return; }
+    let first = up.recorded.load(Ordering::Relaxed) == 0;
+    let mut d = DispatchUpscale {
+        header: Header::new(0x10001), list: host.list.as_raw(), resources,
+        jitter: m.jitter, motion_scale: m.motion_scale, render: m.render, output: m.output,
+        sharpening: work.sharpening, sharpness: work.sharpness.clamp(0.0,1.0),
+        frame_ms: if m.frame_ms.is_finite() && m.frame_ms > 0.0 { m.frame_ms } else { 33.333 },
+        pre_exposure: if work.pre_exposure.is_finite() && work.pre_exposure > 0.0 { work.pre_exposure } else { 1.0 },
+        reset: first || m.reset, near: m.near, far: m.far, fov: m.fov,
+        meters: if m.meters.is_finite() && m.meters > 0.0 { m.meters } else { 1.0 },
+        flags: work.dispatch_flags & 7,
+    };
+    let code = unsafe { (api.dispatch)(&mut *ctx,&mut d.header) };
+    if code != 0 { fail(&format!("SDK returned {code}")); return; }
+    crate::texture::host_written(work.resources[6] as crate::object::This);
+    let n = up.recorded.fetch_add(1,Ordering::Relaxed)+1;
+    if n == 1 || n % 120 == 0 {
+        tracing::info!(n, render=?m.render, output=?m.output, flags=up.flags, jitter=?m.jitter,
+            motion_scale=?m.motion_scale, formats=?resources.map(|r|r.desc[1]), "FSR SR: native AMD upscale recorded");
+    }
+    if let (Some(depth),Some(motion)) = (copies[1].take(),copies[2].take()) {
+        host.note_fsr(Captured { meta:m,depth,motion,active:work.active });
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Key { display: [u32; 2], max_render: [u32; 2], flags: u32, format: u32 }
 struct Frame { ctx: Box<UnsafeCell<Context>>, key: Key }

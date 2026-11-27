@@ -156,3 +156,22 @@ SDK. Look for 'stock sizing: renderer 7, quality mode and temporal scale
 synchronized' and actual render dimensions in 'submitted FidelityFX inputs'.
 Use scale 0 or the original branch if custom sizes fail. The game temporal
 renderer remains unchanged, and its independent FG capture is not implemented.
+
+## Native AMD FSR 3.1 Super Resolution (experimental)
+
+Separate opt-in `-Upscaler amd` uses the Windows SDK already used for FG,
+not NVIDIA or the Xbox shipping upscaler. Based on Foxhound's context-size
+workaround and external dispatch preparation (DexNom, GPL-3.0-or-later).
+The Xbox context is created at 1280x720 -> 1920x1080 for bookkeeping; native
+FSR uses the actual requested context dimensions. Four standard jitter/quality
+queries use the native SDK. The native dispatch is recorded in the thin list
+at the intercepted upscale, with aliased inputs/uploads/depth twins prepared,
+tracked resource transitions and output marked host-written. Original draw
+state is replayed after the SDK records. FG capture is published only after a
+successful native upscale. Do not fall back to Xbox after a failed native
+upscale (mismatched context and history). SDK contexts retained until process
+exit, limit eight pending future fence-based retirement. Start with scale 0
+and FG off, then 0.50 with FG off; only then enable FG. Scale 1.0 previously
+crashed before the first upscale and is intentionally excluded. No guarantee
+custom resolution fixes the title's other allocations. Windows build and GPU
+execution need testing. SDK 1.1.4 ABI checked against ffx_upscale.h.

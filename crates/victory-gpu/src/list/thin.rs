@@ -486,6 +486,7 @@ const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
 const FSR_CAPTURE: u64 = after(17);
+const FSR_UPSCALE: u64 = after(18);
 
 /// Box ownership passes from the front to the translator, or to the
 /// abandonment cleanup. Translated chunks never free the box a second time.
@@ -497,6 +498,14 @@ pub(super) fn put_fsr(this: This, input: crate::fsr_framegen::Captured) -> Resul
     Ok(())
 }
 
+pub(super) fn put_fsr_upscale(this: This, work: crate::fsr_framegen::UpscaleWork) -> Result<(),crate::fsr_framegen::UpscaleWork> {
+    if !wanted() || !on() { return Err(work); }
+    let front = front(this);
+    if front.closed || front.recording.is_none() { return Err(work); }
+    front.put(FSR_UPSCALE,&[Box::into_raw(Box::new(work)) as u64]);
+    Ok(())
+}
+
 fn discard_fsr(words: &[u64]) {
     let mut at = 0;
     while at < words.len() {
@@ -505,6 +514,8 @@ fn discard_fsr(words: &[u64]) {
         if op == FSR_CAPTURE {
             // SAFETY: only called for chunks never interpreted.
             drop(unsafe { Box::from_raw(words[at + 1] as *mut crate::fsr_framegen::Captured) });
+        } else if op == FSR_UPSCALE {
+            drop(unsafe { Box::from_raw(words[at+1] as *mut crate::fsr_framegen::UpscaleWork) });
         }
         at += 1 + len;
     }
@@ -746,6 +757,11 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             if !skip {
                 if let Some(host) = super::host_list(list) { host.note_fsr(input); }
             }
+            continue;
+        }
+        if op == FSR_UPSCALE {
+            let work = *unsafe { Box::from_raw(w[0] as *mut crate::fsr_framegen::UpscaleWork) };
+            if !skip { super::run_fsr_upscale(list,work); }
             continue;
         }
         if skip && op != CLOSE && op != RESET {
