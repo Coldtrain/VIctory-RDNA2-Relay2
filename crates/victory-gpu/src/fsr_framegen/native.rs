@@ -8,6 +8,7 @@ use crate::host::{HostList, legal_state};
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_void};
+use std::mem::offset_of;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
