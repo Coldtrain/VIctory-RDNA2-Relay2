@@ -36,6 +36,31 @@ cargo build --locked --profile diag -p victory --features diagnostics
 }
 ```
 
+### Graphics-only regression test
+
+This branch starts directly from the original RDNA2 Relay2 main commit. It adds
+launcher controls and the existing build-checked resolution hooks from
+`perf/belobug-06a-render-scale` / `perf/belobug-06b-upscaler-choice`.
+No renderer, shader translator, allocator, relay, descriptor, texture or
+pipeline implementation is changed. Series S uses the baseline's existing
+console profile and two-plane presenter.
+
+```powershell
+.\scripts\play.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe' -Console series-x -Upscaler stock
+.\scripts\play.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe' -Console series-s -Upscaler stock
+.\scripts\play.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe' -Console series-s -Upscaler game -RenderScale 0.5
+```
+
+Series X and unmodified scale/upscaler are the default to preserve the main
+baseline. Series S reports 1920x1080 by default; override the reported display
+with `-More @{VICTORY_DISPLAY_MODE='3840x2160'}` if desired.
+`-RenderScale 0` preserves dynamic resolution; custom scale is 0.2–1.0.
+`-Upscaler stock` preserves console selection (FSR on Series S), and requires
+scale 0 to avoid the experimental FSR scaling hook. `-Upscaler game` selects
+the title's own temporal upscaler; auto selects it when custom scale is set.
+The hooks only apply to the known 1.0.2.1 executable hash and expected bytes.
+Keep all other launch overrides and cache conditions consistent when comparing.
+
 The launcher clears most inherited `VICTORY_*` environment variables, so use `-More` for overrides. These are recommended reproduction settings, not a verified record of the exact 15 FPS run. See the upstream instructions below for other launch options, cache configuration and known limitations.
 
 ## Source and credits

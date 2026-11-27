@@ -83,6 +83,15 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        // SAFETY: the mapped main image has the original hash, and no title code has run.
+        let levers = unsafe { crate::hooks::resolution_levers(loaded.base(), &prepared.original_hash) };
+        if levers > 0 {
+            tracing::warn!(applied = levers, scale = ?std::env::var(crate::hooks::RENDER_SCALE_ENV).ok(),
+                own_upscaler = ?std::env::var(crate::hooks::OWN_UPSCALER_ENV).ok(), "title resolution levers applied");
+        } else if std::env::var_os(crate::hooks::RENDER_SCALE_ENV).is_some_and(|v| v != "0" && !v.is_empty())
+            || std::env::var_os(crate::hooks::OWN_UPSCALER_ENV).is_some_and(|v| v != "0") {
+            tracing::warn!("requested resolution/upscaler hooks were not applied; check executable build and hook signatures");
+        }
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),

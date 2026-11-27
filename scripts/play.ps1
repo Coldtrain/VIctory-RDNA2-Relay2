@@ -1,5 +1,8 @@
 # Starts the title with the settings this fork is played with (README.md, "How to run it").
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
+# -Console      series-x (default) or series-s (1080p reported by default)
+# -RenderScale  0 (stock) or 0.2..1.0 (internal scale)
+# -Upscaler     auto (default), game (title temporal), stock (console default)
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
@@ -7,6 +10,9 @@
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
+    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
+    [ValidateRange(0.0, 1.0)][double]$RenderScale = 0,
+    [ValidateSet('auto', 'game', 'stock')][string]$Upscaler = 'auto',
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
@@ -24,7 +30,19 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($Console -eq 'series-s') { $settings.VICTORY_DISPLAY_MODE = '1920x1080' }
+if ($RenderScale -ne 0 -and $RenderScale -lt 0.2) { throw 'RenderScale must be 0 or between 0.2 and 1.0.' }
+$settings.VICTORY_RENDER_SCALE = $RenderScale.ToString('G', [System.Globalization.CultureInfo]::InvariantCulture)
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+# Keep the stock Series S FSR path unmodified; its custom-scale hook is experimental.
+if ($Upscaler -eq 'stock') {
+    if ($settings.VICTORY_RENDER_SCALE -ne '0') { throw 'Stock upscaler test requires RenderScale 0. Use -Upscaler game for custom internal scale.' }
+    $settings.VICTORY_OWN_UPSCALER = '0'
+} elseif ($Upscaler -eq 'game') {
+    $settings.VICTORY_OWN_UPSCALER = '1'
+} elseif (-not $settings.ContainsKey('VICTORY_OWN_UPSCALER')) {
+    $settings.VICTORY_OWN_UPSCALER = if ($settings.VICTORY_RENDER_SCALE -ne '0') { '1' } else { '0' }
+}
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; return }
@@ -35,4 +53,5 @@ Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-O
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+Write-Host "Profile: $Console; display: $($settings.VICTORY_DISPLAY_MODE); render scale: $($settings.VICTORY_RENDER_SCALE); upscaler: $Upscaler; own upscaler: $($settings.VICTORY_OWN_UPSCALER)"
+try { & $victory run $Exe --execute --console $Console } finally { Pop-Location }
