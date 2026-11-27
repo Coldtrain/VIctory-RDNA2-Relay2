@@ -475,8 +475,8 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     if first + 1 == runs.len() {
         return None;
     }
-    let written = line().written.clone();
-    blocked_by(&written, runs, false)?;
+    let (written, by_copy) = line().hazards();
+    blocked_by(&written, &by_copy, runs, false)?;
     let (does, steps) = does_of(&written, runs);
     let mut behind = None;
     if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
@@ -667,16 +667,28 @@ impl Host {
         if stage() == 0 || !relay_exact() {
             return None;
         }
-        let (written, copies) = {
+        let (written, by_copy, copies) = {
             let line = line();
-            if line.written.is_empty() {
+            let (written, by_copy) = line.hazards();
+            if written.is_empty() {
                 return None;
             }
-            (line.written.clone(), copies(&line))
+            (written, by_copy, copies(&line))
         };
-        blocked_by(&written, runs, false)?;
-        let taken = if copied_read(&copies, runs) {
-            Err("a copy done on the card is read through another host copy")
+        blocked_by(&written, &by_copy, runs, false)?;
+        // The GPU prelude can replace copies/fills, not a refresh through
+        // another host copy. Let submit's normal relay wait handle that
+        // dependency, even when this batch also has an eligible GPU fill.
+        let alias_read = runs.iter().any(|list| {
+            list.deferred().copies.iter().any(|step| match step {
+                Step::Refresh(shadow, at, len) => {
+                    touches_other(&written, &by_copy, Arc::as_ptr(shadow) as usize, *at, at.saturating_add(*len))
+                }
+                _ => false,
+            })
+        });
+        let taken = if alias_read || copied_read(&copies, runs) {
+            Err("an in-flight write is read through another host copy")
         } else {
             self.take_steps(&written, runs)
         };
