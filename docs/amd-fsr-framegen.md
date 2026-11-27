@@ -19,14 +19,18 @@ and extract/build its Windows DX12 API DLL, amd_fidelityfx_dx12.dll. No SDK
 binaries are included. Use the pinned SDK version, not the newer split FSR 4
 loader. Point VICTORY_FSR_SDK_DLL to the full absolute DLL path.
 
-PowerShell (from repository root):
+PowerShell (from repository root, using the baseline's existing launcher):
 
     cargo build --locked --profile diag -p victory --features diagnostics
-    $env:VICTORY_FSR_FRAMEGEN = "1"
-    $env:VICTORY_FSR_SDK_DLL = "C:\SDK\FidelityFX-1.1.4\bin\amd_fidelityfx_dx12.dll"
-    $env:VICTORY_THIN = "1"
-    $env:VICTORY_AFMF = "0"
-    .\target\diag\victory.exe run "F:\Games\GTAVI\game_scarlett_master.exe" --execute --console series-s
+    .\scripts\play.ps1 -Exe "F:\Games\GTAVI\game_scarlett_master.exe" -Console series-s -Upscaler stock -More @{
+        VICTORY_FSR_FRAMEGEN = "1"
+        VICTORY_FSR_SDK_DLL = "C:\SDK\FidelityFX-1.1.4\bin\amd_fidelityfx_dx12.dll"
+        VICTORY_AFMF = "0"
+    }
+
+The launcher clears other VICTORY_* environment variables, so put SDK settings
+in -More, not in preceding environment assignments. Leave driver AFMF off in
+Adrenalin and do not use a custom render scale for this first test.
 
 Keep other known-good environment switches; do not force new relay settings.
 If the title starts without FG, search the log for "FSR FG". On a missing SDK,

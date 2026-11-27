@@ -6350,7 +6350,7 @@ impl HostList {
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.fsr_capture.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let _ = self.fsr_capture.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]

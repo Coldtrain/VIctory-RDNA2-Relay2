@@ -212,7 +212,10 @@ impl Backend {
         let Some(frame) = &self.frame else { return !enabled; };
         let Some(api) = api() else { return false; };
         let [w,h] = frame.key.display;
-        let cfg = Configure { header: Header::new(0x20002), swap: swap.as_raw(),
+        // Use the exact interface type returned by the SDK rather than
+        // assuming a queried IDXGISwapChain3 pointer is identical.
+        let Ok(swap4) = swap.cast::<IDXGISwapChain4>() else { return false; };
+        let cfg = Configure { header: Header::new(0x20002), swap: swap4.as_raw(),
             present_cb: None, present_user: std::ptr::null_mut(),
             generate_cb: if enabled { Some(generate) } else { None },
             generate_user: if enabled { frame.handle().cast() } else { std::ptr::null_mut() },
@@ -245,7 +248,15 @@ impl Backend {
     }
 
     fn ensure_frame(&mut self, device: &ID3D12Device, key: Key) -> bool {
-        if let Some(frame) = &self.frame { return frame.key == key; }
+        if let Some(frame) = &self.frame {
+            if frame.key != key {
+                static WARN: std::sync::Once = std::sync::Once::new();
+                WARN.call_once(|| tracing::warn!(previous=?frame.key, requested=?key,
+                    "FSR FG: frame context sizing/flags changed; interpolation stays off for incompatible frames"));
+                return false;
+            }
+            return true;
+        }
         let Some(api) = api() else { return false; };
         let ctx = Box::new(UnsafeCell::new(0));
         let mut backend = DeviceDesc { header: Header::new(2), device: device.as_raw() };
@@ -275,7 +286,11 @@ impl Backend {
             self.disable(swap, id);
             return;
         }
-        let Some(input) = captured else { self.disable(swap,id); return; };
+        let Some(input) = captured else {
+            static NO_INPUT: std::sync::Once = std::sync::Once::new();
+            NO_INPUT.call_once(|| tracing::info!("FSR FG: waiting for a submitted FidelityFX upscale"));
+            self.disable(swap,id); return;
+        };
         let m = input.meta;
         // The title's shipping FidelityFX path only accepts its Series S
         // resolutions. Start with SDR 1080p; no image patch or fake upscaling.
@@ -286,16 +301,29 @@ impl Backend {
             !m.jitter.iter().chain(m.motion_scale.iter()).all(|v| v.is_finite()) ||
             !m.near.is_finite() || !m.far.is_finite() || !m.fov.is_finite() ||
             m.near.min(m.far) <= 0.0 || m.near == m.far || !(0.0..std::f32::consts::PI).contains(&m.fov) {
+            static INVALID: std::sync::Once = std::sync::Once::new();
+            if !m.reset {
+                INVALID.call_once(|| tracing::warn!(?m, ?display, format=format.0,
+                    "FSR FG: unsupported display/camera/render configuration"));
+            }
             self.disable(swap,id);
             return;
         }
         let (Some(depth), Some(motion)) = (resource(&input.depth.texture,4), resource(&input.motion.texture,4)) else {
+            static FORMAT: std::sync::Once = std::sync::Once::new();
+            FORMAT.call_once(|| {
+                let (d,m) = unsafe { (input.depth.texture.GetDesc(),input.motion.texture.GetDesc()) };
+                tracing::warn!(depth_format=d.Format.0, motion_format=m.Format.0, "FSR FG: unsupported native input texture");
+            });
             self.disable(swap,id); return;
         };
         let motion_size = if m.flags & 2 != 0 { display } else { m.render };
         if depth.desc[2] < m.render[0] || depth.desc[3] < m.render[1] ||
             motion.desc[2] < motion_size[0] || motion.desc[3] < motion_size[1] ||
             legal_state(&input.depth.texture,0x40) != 0x40 || legal_state(&input.motion.texture,0x40) != 0x40 {
+            static STATE: std::sync::Once = std::sync::Once::new();
+            STATE.call_once(|| tracing::warn!(depth=?depth.desc, motion=?motion.desc, ?motion_size,
+                "FSR FG: native depth/motion dimensions or shader-read state invalid"));
             self.disable(swap,id); return;
         }
         let key = Key { display, max_render: m.max_render, flags: m.flags & (2|4|8|16),
@@ -311,7 +339,7 @@ impl Backend {
         if self.hudless.len() >= 8 && !self.wait() {
             self.faulted = true; self.disable(swap,id); return;
         }
-        if let Some(_) = hudless { self.hudless.push_back(scene.clone()); }
+        if hudless.is_some() { self.hudless.push_back(scene.clone()); }
         if !self.configure(swap,true,id,hudless.unwrap_or_else(Resource::empty)) {
             // A failed configure may have changed the provider; explicitly disable it.
             self.enabled = true; self.faulted = true; self.disable(swap,id); return;
