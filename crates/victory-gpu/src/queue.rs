@@ -1080,7 +1080,16 @@ fn show_planes(
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present_planes(texture, state, overlay, what.frame);
+    let interpolated = crate::framegen::generate(host, texture, state, overlay.is_some(), what.frame);
+    let generated = interpolated.as_ref().is_some_and(|image| {
+        host.present_fg_planes(image, 0x8, overlay, what.frame, true).is_some()
+    });
+    if generated { crate::framegen::presented(); }
+    let shown = if generated {
+        host.present_fg_planes(texture, state, overlay, what.frame, false)
+    } else {
+        host.present_planes(texture, state, overlay, what.frame)
+    };
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]

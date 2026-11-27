@@ -6705,6 +6705,7 @@ impl HostList {
             }
         }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
+            crate::framegen::note_submitted(copy, *first, *last);
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
             (real != *first)
@@ -9007,6 +9008,21 @@ impl Host {
         overlay: Option<(&ID3D12Resource, u32)>,
         frame: u64,
     ) -> Option<bool> {
+        self.present_planes_impl(texture, state, overlay, frame, false, false)
+    }
+
+    pub(crate) fn present_fg_planes(
+        &self, texture: &ID3D12Resource, state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>, frame: u64, generated: bool,
+    ) -> Option<bool> {
+        self.present_planes_impl(texture, state, overlay, frame, generated, true)
+    }
+
+    fn present_planes_impl(
+        &self, texture: &ID3D12Resource, state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>, frame: u64,
+        generated: bool, fg_pacing: bool,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let planes = overlay.and_then(|(over, over_state)| {
@@ -9101,7 +9117,7 @@ impl Host {
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let read_now = !generated && (crate::capture::wanted(frame) || crate::capture::listed(frame));
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
             let slot = if late_free_present() && !read_now {
@@ -9194,7 +9210,7 @@ impl Host {
                 list.CopyResource(&back, texture);
             }
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
+            let capture = (!generated && crate::capture::wanted(frame))
                 .then(|| {
                     if composed {
                         list.ResourceBarrier(&[transition(
@@ -9215,13 +9231,13 @@ impl Host {
                 })
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() || composed {
+            let probe = if generated || slot.is_some() || composed {
                 None
             } else {
                 crate::capture::probe(&self.device, list, texture)
             };
             #[cfg(feature = "diagnostics")]
-            let watched = if composed {
+            let watched = if generated || composed {
                 None
             } else {
                 crate::popwatch::take(&self.device, list, texture)
@@ -9271,13 +9287,19 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             #[cfg(feature = "diagnostics")]
-            crate::replay::record::present(texture, state);
+            if !generated { crate::replay::record::present(texture, state); }
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let presented = p.swap_chain.Present(if fg_pacing { 1 } else { 0 }, DXGI_PRESENT(0));
+            if generated && presented.is_err() {
+                tracing::warn!(error = ?presented, "FSR generated frame present failed");
+                return None;
+            }
             showing.next("the frame meter");
-            #[cfg(feature = "diagnostics")]
-            p.panel.frame(p.meter.line_due());
-            p.meter.frame(p.hwnd);
+            if !generated {
+                #[cfg(feature = "diagnostics")]
+                p.panel.frame(p.meter.line_due());
+                p.meter.frame(p.hwnd);
+            }
             showing.end();
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));

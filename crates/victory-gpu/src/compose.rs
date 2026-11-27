@@ -35,6 +35,10 @@ float4 ps(V v) : SV_Target {
 float4 ps_scene(V v) : SV_Target {
     return float4(scene.SampleLevel(smooth_, v.uv, 0).rgb, 1);
 }
+[RootSignature(RS)]
+float ps_depth(V v) : SV_Target {
+    return scene.Load(int3(int2(v.at.xy), 0)).r;
+}
 "#;
 
 // Read once at compositor creation; the regular shader remains the default.
@@ -81,10 +85,15 @@ impl Composer {
         if preview {
             tracing::warn!("framegen diagnostic: scene plane only; HUD hidden; no interpolation is active");
         }
-        let (vs, ps) = (
-            compile(s!("vs"), s!("vs_5_1"))?,
-            compile(if preview { s!("ps_scene") } else { s!("ps") }, s!("ps_5_1"))?,
-        );
+        Self::with_shader(host, format, if preview { s!("ps_scene") } else { s!("ps") })
+    }
+
+    pub(crate) fn new_depth(host: &Host) -> windows::core::Result<Self> {
+        Self::with_shader(host, DXGI_FORMAT_R32_FLOAT, s!("ps_depth"))
+    }
+
+    fn with_shader(host: &Host, format: DXGI_FORMAT, pixel: PCSTR) -> windows::core::Result<Self> {
+        let (vs, ps) = (compile(s!("vs"), s!("vs_5_1"))?, compile(pixel, s!("ps_5_1"))?);
         // SAFETY: the blobs' own bytes, alive through the calls.
         unsafe {
             let bytes = |b: &ID3DBlob| {

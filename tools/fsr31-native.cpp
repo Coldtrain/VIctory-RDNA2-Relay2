@@ -1,4 +1,5 @@
 #include "fsr31-native.h"
+#define NOMINMAX
 #include <windows.h>
 #include <d3d12.h>
 #include <ffx_api/ffx_api.h>
@@ -8,6 +9,7 @@
 #include <memory>
 #include <algorithm>
 #include <new>
+#include <initializer_list>
 
 struct VfgContext {
     HMODULE library{};

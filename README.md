@@ -279,3 +279,39 @@ This is a tree of other people's work with more on top. The upstream repository 
 
 GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
 covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+
+### Experimental live FSR 3.1 frame generation (2x)
+
+This branch connects the native bridge to the two-plane presenter. Hardware depth
+is converted on the GPU, the HUD-free scene and candidate motion vectors are fed
+to AMD, then the interpolated scene and the real scene are presented with the
+original HUD. First/reset frames are not displayed. The native FPS counter remains
+tied to real frames. The generated-present log counts DXGI calls, not measured
+monitor FPS.
+
+**Experimental:** candidate selection uses the actual submitted texture states,
+dimensions and formats. Their semantics and camera values are not verified:
+defaults are reversed-Z, identity camera basis, zero jitter, normalized motion
+vectors. The additional list is synchronous; Present(1) orders the two presents
+but is not an optimized frame pacing implementation. No Windows compile or GPU
+runtime test has been performed. The normal path is unchanged when disabled.
+
+Build with x64 Visual Studio Developer PowerShell and matching AMD SDK v1.1.4:
+```powershell
+.\scripts\build-fsr31-native.ps1 -SdkRoot 'C:\SDK\FidelityFX-SDK-1.1.4'
+cargo build --locked --profile diag -p victory --features diagnostics
+```
+
+Add these to the usual play command's -More hashtable:
+```powershell
+VICTORY_FSR_FRAMEGEN='1'
+VICTORY_FSR_DLL='C:\SDK\bin\amd_fidelityfx_dx12.dll'
+VICTORY_FSR_RENDER_SIZE='576x324'
+```
+The supplied log had 1920x1080 presentation and 576x324 internal resources.
+Use the actual resource size, not the nominal window size. At 720p/0.30,
+384x216 is only an initial assumption. Optional overrides:
+VICTORY_FSR_BRIDGE (absolute or repo-relative DLL path), VICTORY_FSR_DEPTH_FORMAT
+(19 or 44), VICTORY_FSR_MOTION_FORMAT (34 or 16), VICTORY_FSR_FLAGS,
+VICTORY_FSR_MV_X/Y, VICTORY_FSR_JITTER_X/Y, VICTORY_FSR_NEAR/FAR/FOV.
+Disable with VICTORY_FSR_FRAMEGEN=0.
