@@ -1265,12 +1265,59 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
+/// Belobug's 16 GB card residency policy. Independently reversible.
+#[cfg(windows)]
+pub(crate) fn amd_texture_budget() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_AMD_TEXTURE_BUDGET").is_some_and(|v| v == "1"))
+}
+
+/// Local VRAM pressure, sampled at most once per tenth of a second.
+#[cfg(windows)]
+fn video_memory_percent() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tenth = crate::host::now_ms() / 100 + 1;
+    let last = LAST.load(Relaxed);
+    if last >> 8 == tenth { return last & 0xff; }
+    let pct = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .and_then(|[budget, used, ..]| (budget > 0).then(|| ((u128::from(used) * 100) / u128::from(budget)).min(255) as u64))
+        .unwrap_or(0);
+    LAST.store((tenth << 8) | pct, Relaxed);
+    pct
+}
+
+#[cfg(windows)]
+fn texture_cap(pct: u64) -> u64 {
+    match pct { 0..92 => 1024, 92..97 => 512, _ => 256 }
+}
+
+/// Number of leading levels to omit for streamed, CPU-filled textures.
+/// VICTORY_TEXTURE_MAX=0 disables the cap; unset uses Belobug's adaptive cap.
+#[cfg(windows)]
+fn over_cap(desc: &ResourceDesc) -> u32 {
+    if !amd_texture_budget() { return 0; }
+    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| std::env::var("VICTORY_TEXTURE_MAX").ok().and_then(|v| v.trim().parse::<u64>().ok()));
+    if set == Some(0) { return 0; }
+    let max = set.unwrap_or_else(|| texture_cap(video_memory_percent()));
+    let mut skip = 0u32;
+    while skip < 63 && skip + 1 < u32::from(desc.mip_levels)
+        && ((desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max)
+    {
+        skip += 1;
+    }
+    skip
+}
+
 /// The level a host copy begins at for views that start at `first`: one the
 /// host can have as a texture's level 0 ([`read_from`]; block-compressed
 /// formats in whole blocks).
 #[cfg(windows)]
 fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     const TEXTURE_2D: u32 = 3;
+    let first = first.max(over_cap(desc));
     if first == 0
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
@@ -1577,13 +1624,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
         let mut base = 0;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            if first != u32::MAX {
-                base = base_level(&r.desc, first);
-            }
+            base = base_level(&r.desc, if first == u32::MAX { 0 } else { first });
         }
         let texture = match texture {
             Some(texture) => Some(texture),

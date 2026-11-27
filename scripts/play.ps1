@@ -31,6 +31,9 @@ $settings = @{
 $settings.VICTORY_PLANES = '1'
 $settings.VICTORY_PORT_CONSTANTS = '1'
 $settings.VICTORY_PORT_AMD_PROBE_FILTER = '1'
+$settings.VICTORY_PORT_AMD_TEXTURE_BUDGET = '1'
+# Preserve full-resolution streamed textures for the first correctness test.
+$settings.VICTORY_TEXTURE_MAX = '0'
 $settings.VICTORY_PORT_DESCRIPTORS = '0'
 $settings.VICTORY_PORT_CBV = '0'
 $settings.VICTORY_PORT_CBV_PLACE = '0'
