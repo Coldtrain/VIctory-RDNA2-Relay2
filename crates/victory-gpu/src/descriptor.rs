@@ -963,6 +963,9 @@ impl Views {
             return Some(at);
         }
         if self.shapes.len() >= SHAPES {
+            static WARN: std::sync::Once = std::sync::Once::new();
+            WARN.call_once(|| tracing::warn!(limit=SHAPES,
+                "placed descriptor shape cache full; new shapes fall back to persistent view entries"));
             return None;
         }
         let at = self.shapes.len() as u32;
@@ -1016,10 +1019,36 @@ impl Views {
     }
 }
 
+/// Same opt-out as the placed texture resource cache. Separate opt-out
+/// permits A/B tests without changing the resource cache policy.
+fn placed_descriptor_normalization() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PLACED_FILLER").is_none_or(|v| v != "1")
+            && std::env::var_os("VICTORY_DESCRIPTOR_NORMALIZE").is_none_or(|v| v != "0");
+        tracing::info!(on, "placed descriptor texture padding normalization");
+        on
+    })
+}
+fn normalize_placed_texture(resource: &mut [u32; 14]) {
+    if matches!(resource[0], 2..=4) {
+        resource[1] = 0;
+        resource[13] = 0;
+    }
+}
+
 /// The two words that name `view` in a record: the view itself where its
 /// kind allows ([`Views`]), else its table entry.
-fn words_for(view: View) -> [u32; 2] {
+fn words_for(mut view: View) -> [u32; 2] {
     use std::sync::atomic::Ordering::Relaxed;
+    // texture_at and same_placed_texture already ignore these two padding
+    // words. Canonicalize before both inline shape and full-entry lookup.
+    // Preserve buffer views and unknown resource dimensions verbatim.
+    if placed_descriptor_normalization() {
+        if let View::Placed(_, resource, _) = &mut view {
+            normalize_placed_texture(resource);
+        }
+    }
     if inline() {
         match &view {
             View::Constant(address, size) => {
@@ -1720,6 +1749,36 @@ mod tests {
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1000, 512));
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1100, 256));
         assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
+    }
+
+    #[test]
+    fn placed_texture_descriptor_padding_is_not_a_shape() {
+        for dimension in 2..=4 {
+            let mut a = [0u32;14];
+            a[0] = dimension;
+            a[4] = 960;
+            a[6] = 540;
+            let mut b = a;
+            b[1] = 0x1234abcd;
+            b[13] = 0xdeadbeef;
+            let desc = [0u32;16];
+            normalize_placed_texture(&mut a);
+            normalize_placed_texture(&mut b);
+            assert_eq!(a,b);
+            assert_eq!(shape_of(false,&a,&desc),shape_of(false,&b,&desc));
+            b[4] += 1;
+            assert_ne!(shape_of(false,&a,&desc),shape_of(false,&b,&desc));
+            assert_ne!(shape_of(false,&a,&desc),shape_of(true,&a,&desc));
+        }
+        let mut buffer = [7u32;14];
+        buffer[0] = 1;
+        let original = buffer;
+        normalize_placed_texture(&mut buffer);
+        assert_eq!(buffer,original);
+        let mut unknown = [7u32;14];
+        let original = unknown;
+        normalize_placed_texture(&mut unknown);
+        assert_eq!(unknown,original);
     }
 
     /// The leak of run 65: a title that writes constant buffer views and

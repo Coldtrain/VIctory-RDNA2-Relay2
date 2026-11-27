@@ -175,3 +175,19 @@ and FG off, then 0.50 with FG off; only then enable FG. Scale 1.0 previously
 crashed before the first upscale and is intentionally excluded. No guarantee
 custom resolution fixes the title's other allocations. Windows build and GPU
 execution need testing. SDK 1.1.4 ABI checked against ffx_upscale.h.
+
+## Long-session descriptor stability test
+
+The 2026-11-27 native SR+FG run recorded 20,880+ successful upscales and
+interpolations, then a title access violation at RVA 0x4e9b54a. The last
+memory sample showed only 585 MB system commit headroom, 4,194,304 placed
+shapes and 2,323,824 persistent placed-view entries. The shape cache was
+full and new shapes fell back to full persistent entries. Normalize only
+resource-description padding words 1 and 13 for known texture dimensions
+(2,3,4), as already done in resource::texture_at and same_placed_texture.
+No change to native FSR, scale, shader translation, buffer views, or
+command ordering. VICTORY_DESCRIPTOR_NORMALIZE=0 restores previous behavior;
+VICTORY_PLACED_FILLER=1 also disables normalization. Log once when shape
+capacity is reached. This addresses a concrete duplicate-key mechanism;
+the access violation's exact cause is not established. Repeat the same
+long session with commit headroom and descriptor counts monitored.
