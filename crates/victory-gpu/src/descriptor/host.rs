@@ -2858,6 +2858,25 @@ impl HostHeap {
 
     /// As [`HostHeap::copy_to`], from the slot `from`, which the card does not
     /// see.
+    // Dynamic slots can also be recycled while older recordings remain
+    // outstanding. Protect every shader-visible descriptor copy, including
+    // dynamic raw twins, until the previously submitted GPU work completes.
+    fn publication(&self, _to: u32, host: &crate::host::Host) -> Option<std::sync::MutexGuard<'static, u64>> {
+        crate::host::descriptor_publication(host)
+    }
+
+    // An in-place Create*View would bypass the publication fence entirely.
+    // In fenced mode require staging; never silently write to a visible heap.
+    fn staged_or_cpu(&self, index: u32, which: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        match staged(self.sampler, which) {
+            Some(at) => at,
+            None if crate::host::descriptor_fence_on() => {
+                crate::host::fail(format_args!("no CPU descriptor staging slot for fenced publication: index={index} lane={which}"))
+            }
+            None => self.cpu(index),
+        }
+    }
+
     fn copy_from(&self, to: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
         #[cfg(feature = "diagnostics")]
         if let Some(written) = self.written.get(to as usize) {
@@ -2865,6 +2884,7 @@ impl HostHeap {
         }
         let Some(host) = host() else { return };
         // SAFETY: a slot of our heap, and one of this thread's heap.
+        let _publication = self.publication(to, host);
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
     }
 
@@ -2883,7 +2903,7 @@ impl HostHeap {
 
     /// Where the raw twin of slot `index` is made.
     fn twin(&self, index: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
-        (index < self.twins.len() as u32).then(|| staged(self.sampler, 1).unwrap_or_else(|| self.cpu(self.raw + index)))
+        (index < self.twins.len() as u32).then(|| self.staged_or_cpu(self.raw + index, 1))
     }
 
     /// The raw twin of slot `index` was made by this thread ([`make_twinned`]),
@@ -3170,7 +3190,7 @@ impl HostHeap {
     /// a slot of this thread's in a heap the card does not see
     /// ([`staged`]), or the slot itself.
     fn at(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        staged(self.sampler, 0).unwrap_or_else(|| self.cpu(index))
+        self.staged_or_cpu(index, 0)
     }
 
     /// The descriptor this thread made last ([`HostHeap::at`]) goes to slot
@@ -3200,6 +3220,7 @@ impl HostHeap {
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
         };
         // SAFETY: a slot of our heap, and one of this thread's heap slots.
+        let _publication = self.publication(to, host);
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, kind) };
     }
 

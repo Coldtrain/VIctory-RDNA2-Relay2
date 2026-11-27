@@ -513,11 +513,19 @@ fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
-        if n == 0 {
-            return;
+        // Producers can enqueue out of submission order. An ineligible
+        // entry must not pin all eligible objects behind it.
+        let mut done = Vec::new();
+        let mut pending = std::collections::VecDeque::new();
+        while let Some(entry) = retired.pop_front() {
+            if entry.0 <= finished {
+                done.push(entry);
+            } else {
+                pending.push_back(entry);
+            }
         }
-        retired.drain(..n).collect()
+        *retired = pending;
+        done
     };
     drop(done);
 }
@@ -2489,6 +2497,53 @@ fn relay_exact() -> bool {
     // since the walls of the first room were found drawn in every run with
     // this set and in fewer than half without it).
     *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_none_or(|v| v == "2"))
+}
+
+// Port of the 14b descriptor publication fence. Protect CPU descriptor
+// writes against the queue's last submitted GPU reads, not CPU landing.
+static DESCRIPTOR_HORIZON: Mutex<u64> = Mutex::new(0);
+static DESCRIPTOR_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DESCRIPTOR_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn descriptor_fence_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let enabled = relay_exact() && std::env::var_os("VICTORY_DESCRIPTOR_FENCE").is_none_or(|v| v != "0");
+        tracing::info!(enabled, "Relay descriptor publication fence (VICTORY_DESCRIPTOR_FENCE)");
+        enabled
+    })
+}
+
+pub(crate) fn descriptor_publication(host: &Host) -> Option<std::sync::MutexGuard<'static, u64>> {
+    if !descriptor_fence_on() { return None; }
+    let guard = DESCRIPTOR_HORIZON.lock().unwrap_or_else(|e| e.into_inner());
+    let target = *guard;
+    // SAFETY: a live fence; a null event requests a synchronous fence wait.
+    let result = unsafe {
+        let completed = host.fence.GetCompletedValue();
+        if completed < target {
+            let began = std::time::Instant::now();
+            let result = host.fence.SetEventOnCompletion(target, HANDLE::default())
+                .and_then(|()| host.device.GetDeviceRemovedReason());
+            DESCRIPTOR_WAITS.fetch_add(1, Ordering::Relaxed);
+            DESCRIPTOR_WAIT_US.fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+            result
+        } else {
+            host.device.GetDeviceRemovedReason()
+        }
+    };
+    if let Err(e) = result {
+        drop(guard);
+        fail(format_args!("descriptor publication fence {target} failed ({e})"));
+    }
+    Some(guard)
+}
+
+fn descriptor_fence_line(frames: f64) {
+    if !descriptor_fence_on() { return; }
+    let waits = DESCRIPTOR_WAITS.swap(0, Ordering::Relaxed) as f64 / frames.max(1e-9);
+    let ms = DESCRIPTOR_WAIT_US.swap(0, Ordering::Relaxed) as f64 / frames.max(1e-9) / 1000.0;
+    tracing::info!("descriptor publication fence per frame: {waits:.1} waits, {ms:.2} ms");
 }
 
 /// Whether the pieces the relay fetches from the card's memory come over the
@@ -5728,6 +5783,7 @@ impl Host {
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
             // SAFETY: closed lists; the fence is ours.
+            let mut descriptor_horizon = descriptor_fence_on().then(|| DESCRIPTOR_HORIZON.lock().unwrap_or_else(|e| e.into_inner()));
             let signalled = unsafe {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
@@ -5736,6 +5792,12 @@ impl Host {
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            if signalled.is_ok() {
+                if let Some(horizon) = descriptor_horizon.as_mut() { **horizon = *submitted; }
+            } else {
+                fail(format_args!("descriptor-protected submission could not signal its fence"));
+            }
+            drop(descriptor_horizon);
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
@@ -5784,6 +5846,7 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
+            let mut descriptor_horizon = descriptor_fence_on().then(|| DESCRIPTOR_HORIZON.lock().unwrap_or_else(|e| e.into_inner()));
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -5792,6 +5855,11 @@ impl Host {
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                if let Some(horizon) = descriptor_horizon.as_mut() {
+                    if waited.is_err() { fail(format_args!("descriptor-protected synchronous submission could not signal its fence")); }
+                    **horizon = *submitted;
+                }
+                drop(descriptor_horizon);
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp);
                 match waited {
@@ -8984,6 +9052,7 @@ impl Meter {
         );
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
+        descriptor_fence_line(frames);
         crate::port_cbv::log(frames);
         late_line(frames);
         crate::queue::behind_line(frames);

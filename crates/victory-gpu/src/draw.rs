@@ -493,6 +493,12 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
+        // A closed title list may be submitted again without Reset.
+        // Relay can overlap that execution with other recordings. Keep its
+        // descriptor allocations owned by State until the recording is dropped.
+        if crate::shadow::relay() {
+            return;
+        }
         if self.tables_gone && self.dynamic.is_empty() {
             return;
         }
