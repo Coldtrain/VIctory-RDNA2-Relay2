@@ -160,7 +160,7 @@ fn air() -> f32 {
 
 /// How the slow mean of the light around follows the frames
 /// (`VICTORY_AMBIENT_SETTLE=<time constant in ms>[,<jump factor>[,<fresh
-/// seconds>]]`; unset or 0: 0.04 of the way a frame, as before, which is 25
+/// seconds>]]`; unset: 250,3; 0: 0.04 of the way a frame, as before, which is 25
 /// frames: 0.8 s at the console's 30 frames a second, 2-4 s at 7-13). Set,
 /// it is the same share of the way a second whatever the frame rate, and a
 /// change by more than the jump factor (default 3; 0: none) is taken at
@@ -177,7 +177,8 @@ struct Settle {
 fn settle() -> Option<Settle> {
     static SET: OnceLock<Option<Settle>> = OnceLock::new();
     *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_SETTLE").ok()?;
+        // Default on (250 ms, jump factor 3), as upstream.
+        let set = std::env::var("VICTORY_AMBIENT_SETTLE").unwrap_or_else(|_| "250,3".to_owned());
         let mut parts = set.split(',').map(|p| p.trim().parse::<f32>().ok());
         let ms = parts.next().flatten().filter(|v| v.is_finite() && *v > 0.0)?;
         let jump = parts.next().flatten().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(3.0);
@@ -441,6 +442,8 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
+    // Filter magenta garbage probes left by uninitialized/corrupted memory on AMD.
+    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     float bound = fresh > 0.0 ? lerp(1.0, most, saturate(cells[CELLS].a / fresh)) : most;
@@ -586,7 +589,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[10] = air().to_bits();
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
-    words[14] = if settle().is_some() { (frame_ms(role) / 1000.0).to_bits() } else { 0.0f32.to_bits() };
+    words[14] = (frame_ms(role) / 1000.0).to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
