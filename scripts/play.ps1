@@ -6,6 +6,8 @@
 # -AFMF         request borderless fullscreen for driver AFMF (enable per-app in Adrenalin)
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
+# -RTResolve    enable ray-traced resolve independently of the BVH builder
+# -ActivateRays enable screen-probe ray activation independently of the BVH builder
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
@@ -17,6 +19,8 @@ param(
     [switch]$AFMF,
     [switch]$Safe,
     [switch]$RayTracing,
+    [switch]$RTResolve,
+    [switch]$ActivateRays,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
@@ -32,6 +36,8 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($RTResolve) { $settings.VICTORY_RT_RESOLVE = '1' }
+if ($ActivateRays) { $settings.VICTORY_ACTIVATE_RAYS = '1' }
 if ($Console -eq 'series-s') { $settings.VICTORY_DISPLAY_MODE = '1920x1080' }
 if ($RenderScale -ne 0 -and $RenderScale -lt 0.2) { throw 'RenderScale must be 0 or between 0.2 and 1.0.' }
 $settings.VICTORY_RENDER_SCALE = $RenderScale.ToString('G', [System.Globalization.CultureInfo]::InvariantCulture)

@@ -56,30 +56,30 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
-fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
-    let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return false;
-        }
-        // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
-        // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
-        std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0")
-    });
-    if skip_rt && named(shaders, b"CS_RaytracingResolve") {
-        return Some("shades ray-tracing hits without BVH, left out");
+// Explicit 0/1 overrides the builder-dependent default.
+fn rt_pass_enabled(builder: bool, value: Option<&str>) -> bool {
+    match value {
+        Some("0") => false,
+        Some("1") => true,
+        _ => builder,
     }
-    static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
-    let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
+}
+
+fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    static SWITCHES: OnceLock<(bool, bool)> = OnceLock::new();
+    let &(rt, activate) = SWITCHES.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
-        }
-        std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
+        let rt = rt_pass_enabled(builder, std::env::var("VICTORY_RT_RESOLVE").ok().as_deref());
+        let activate = rt_pass_enabled(builder, std::env::var("VICTORY_ACTIVATE_RAYS").ok().as_deref());
+        tracing::info!(builder_requested = builder, rt_resolve = rt, activate_rays = activate,
+            "ray-tracing pass selection");
+        (rt, activate)
     });
-    if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
-        return Some("ray activation shader without BVH, left out");
+    if !rt && named(shaders, b"CS_RaytracingResolve") {
+        return Some("ray-tracing resolve disabled by pass selection");
+    }
+    if !activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
+        return Some("ray activation disabled by pass selection");
     }
     None
 }
@@ -558,6 +558,15 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ray_pass_switches_preserve_defaults_and_allow_explicit_overrides() {
+        for builder in [false, true] {
+            assert_eq!(rt_pass_enabled(builder, None), builder);
+            assert!(rt_pass_enabled(builder, Some("1")));
+            assert!(!rt_pass_enabled(builder, Some("0")));
+        }
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
