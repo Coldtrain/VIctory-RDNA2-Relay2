@@ -16,9 +16,9 @@ Source comparison:
   6 or 7 by default. Its README describes them as opt-in. Our launcher
   forced them on, including custom CBV Relay 2 placement overrides. Port 1
   maps the skinning output/constant heap in place; port 5 changes constant
-  reads. To isolate the geometry path, default run.ps1 disables these
-  switches but retains our native FSR, Series S, scale, timing, lighting,
-  Relay 2 and other existing settings. This is not an exact whole-build
+  reads. To isolate the geometry path, the original reference profile disabled these
+  switches; the updated hardcoded launcher preserves the maintainer's supplied
+  values, and documents the manual reference A/B configuration. This is not an exact whole-build
   reproduction, only a reference geometry-memory configuration.
 - The reference's benchmark explicitly enabled some ports; the user's
   actual working reference run settings are not known.
@@ -26,13 +26,16 @@ Source comparison:
   the geometry routines reviewed were already present. No claim that
   these switches fix NPC stretching.
 
-Run:
-    .\run.ps1
-Compare with same executable and scene:
-    .\run.ps1 -SkipBuild -PerformancePorts
-If only the reference profile works, reenable each port separately via
--More, starting with PORT_CONSTANTS and PORT_CBV separately. Avoid enabling
-CBV placement on Relay 2 until the copied path is visually verified.
+Launcher update: run.ps1 now follows the maintainer's supplied hardcoded
+50% render scale and 512 MB texture limit. It preserves the supplied
+performance settings (renderer ports enabled) rather than silently changing
+them. No script parameters. Run .\run.ps1 from the repository root.
+For the reference geometry-memory A/B test, edit the seven renderer-port
+values in the marked block to '0' and run again. Both configurations keep
+SEND_CHANGED=0 and the two lighting passes enabled, with the BVH builder off.
+If only the reference profile works, reenable each port separately, starting
+with PORT_CONSTANTS and PORT_CBV. Avoid enabling CBV placement on Relay 2
+until the copied path is visually verified.
 If both fail, the difference is not isolated to these flags; inspect
 specific mesh shader failures, geometry inputs and buffer contents.
 Windows build and visual validation remain pending.
