@@ -1,13 +1,14 @@
 # Sprint 6 + Belobug rendering fixes. Run from the repo root.
 # Example: .\run.ps1 -Exe 'F:\Games\GTAVI\game_scarlett_master.exe' -FsrDll 'F:\Games\FSR\amd_fidelityfx_dx12.dll'
 param(
-    [Parameter(Mandatory)][string]$Exe,
-    [Parameter(Mandatory)][string]$FsrDll,
+    [string]$Exe = 'F:\Games\GTAVI\game_scarlett_master.exe',
+    [string]$FsrDll = 'F:\Games\FSR\amd_fidelityfx_dx12.dll',
     [ValidateRange(0,1)][int]$RTResolve = 1,
     [ValidateRange(0,1)][int]$ActivateRays = 1,
     [ValidateRange(0,1)][int]$BvhBuilder = 0,
     [ValidateRange(0,4)][double]$Ambient = 0.8,
     [ValidateRange(0,2147483647)][int]$DescriptorPages = 64,
+    [ValidateRange(0,1)][int]$GeometryOrdering = 1,
     [hashtable]$More = @{},
     [switch]$SkipBuild
 )
@@ -33,6 +34,11 @@ try {
         VICTORY_PORT_AMD_TEXTURE_BUDGET='1'
         VICTORY_TEXTURE_MAX='0'
         VICTORY_PORT_CONSTANTS='1'
+        # Preserve complete refreshes (Belobug 6ae06963: partial refreshes exploded geometry).
+        VICTORY_SEND_CHANGED='0'
+        # Clamp only in-place indirect records at their point of execution.
+        VICTORY_PORT_CONSTANTS_ORDER=[string]$GeometryOrdering
+        VICTORY_PORT_CONSTANTS_ORDER_ALONE='1'
         VICTORY_PORT_DESCRIPTORS='1'
         VICTORY_PORT_DESCRIPTORS_CHECK=[string]$DescriptorPages
         VICTORY_PORT_DESCRIPTORS_EVERY='1'
@@ -71,7 +77,6 @@ try {
     }
     # The later experimental branch switches are intentionally not active:
     # VICTORY_PRECISE_PACING, VICTORY_TIMER_LOG, VICTORY_PORT_AMD_PROBE_FILTER,
-    # VICTORY_PORT_CONSTANTS_ORDER, VICTORY_PORT_CONSTANTS_ORDER_ALONE,
     # VICTORY_PORT_JOURNAL, VICTORY_TEXTURE_PRELUDE, VICTORY_AMBIENT_SETTLE,
     # VICTORY_AMBIENT_RT, VICTORY_LIGHTING_MODE, VICTORY_SCREEN_GI_LEVEL.
     # This branch parses the descriptor fallback budget as a number, not 'all'.
