@@ -46,6 +46,33 @@ pub(crate) struct Pending {
     screen: bool,
     /// Confirmed first-scene / bake producer prepared early even on a cold cache.
     scene_input: bool,
+    /// Explicit diagnostic exclusion, fixed for the life of this process.
+    left_out: Option<&'static str>,
+}
+
+fn excluded_pass(stage: &str, container: &[u8], skip_rt: bool, skip_activate: bool) -> Option<&'static str> {
+    if stage != "compute" {
+        return None;
+    }
+    let named = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
+    if skip_rt && named(b"CS_RaytracingResolve") {
+        Some("disabled by VICTORY_RT_RESOLVE=0")
+    } else if skip_activate && named(b"CS_ScreenProbes_ActivateRays") {
+        Some("disabled by VICTORY_ACTIVATE_RAYS=0")
+    } else {
+        None
+    }
+}
+
+fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    static SWITCHES: OnceLock<(bool, bool)> = OnceLock::new();
+    let &(skip_rt, skip_activate) = SWITCHES.get_or_init(|| {
+        let rt = std::env::var_os("VICTORY_RT_RESOLVE").is_some_and(|v| v == "0");
+        let activate = std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
+        tracing::info!(rt_resolve = !rt, activate_rays = !activate, "lighting pipeline A/B switches");
+        (rt, activate)
+    });
+    shaders.iter().find_map(|s| excluded_pass(&s.stage, &s.container, skip_rt, skip_activate))
 }
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold
@@ -82,9 +109,11 @@ impl Pending {
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
+        let left_out = left_out(&shaders);
         Pending {
             screen,
             scene_input,
+            left_out,
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -116,6 +145,9 @@ impl Pending {
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(reason) = p.left_out {
+        return Some(reason.into());
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
@@ -183,6 +215,9 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.left_out.is_some() {
+        return None;
+    }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -198,6 +233,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.left_out.is_some() {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -206,6 +244,9 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// run drew with it (during loading, so the world's first frames find it),
 /// or if it is a confirmed opening-scene / bake producer.
 pub(crate) fn early(p: &Arc<Pending>) {
+    if p.left_out.is_some() {
+        return;
+    }
     if !p.shaders.is_empty() && (p.scene_input || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, if p.scene_input { REQUESTED } else { EARLY });
@@ -388,6 +429,9 @@ static AVAILABLE: Condvar = Condvar::new();
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
 fn start(p: &Arc<Pending>, priority: u8) {
+    if p.left_out.is_some() {
+        return;
+    }
     if p.queue_state.load(Ordering::Relaxed) >= priority {
         return;
     }
@@ -511,6 +555,32 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lighting_switches_exclude_only_the_selected_compute_pass() {
+        let rt = b"CS_RaytracingResolve";
+        let activate = b"CS_ScreenProbes_ActivateRays";
+        assert!(excluded_pass("compute", rt, false, false).is_none());
+        assert!(excluded_pass("compute", activate, false, false).is_none());
+        assert!(excluded_pass("compute", rt, true, false).is_some());
+        assert!(excluded_pass("compute", activate, true, false).is_none());
+        assert!(excluded_pass("compute", rt, false, true).is_none());
+        assert!(excluded_pass("compute", activate, false, true).is_some());
+        assert!(excluded_pass("pixel", rt, true, true).is_none());
+        assert!(excluded_pass("compute", b"CS_ScreenProbes_TemporalResolve", true, true).is_none());
+    }
+
+    #[test]
+    fn excluded_pipeline_never_enters_worker_queue() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.left_out = Some("test exclusion");
+        let p = Arc::new(p);
+        early(&p);
+        assert!(ready(&p).is_none());
+        assert!(!now(&p));
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert!(p.made.get().is_none());
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
