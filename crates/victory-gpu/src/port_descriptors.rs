@@ -232,10 +232,23 @@ fn check_every() -> u64 {
 }
 
 /// Pages the fallback looks at a frame (`VICTORY_PORT_DESCRIPTORS_CHECK=<pages>`,
-/// 16 if not given; 0: none).
+/// 16 if not given; `all`: every written page at every sync when EVERY=1; 0: none).
 fn check_budget() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_PORT_DESCRIPTORS_CHECK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16usize))
+    *N.get_or_init(|| budget_of(std::env::var("VICTORY_PORT_DESCRIPTORS_CHECK").ok().as_deref()))
+}
+
+/// Upstream 4aeb6d0: keep the normal budget; allow a complete correctness check.
+fn budget_of(spec: Option<&str>) -> usize {
+    match spec.map(str::trim) {
+        None => 16,
+        Some("all") => usize::MAX,
+        Some(v) => v.parse().unwrap_or(16),
+    }
+}
+
+fn whole() -> bool {
+    check_budget() == usize::MAX && check_every() == 1
 }
 
 /// The fallback's pages: those the watch said were written, not looked at yet;
@@ -252,6 +265,7 @@ static FALLBACK: std::sync::Mutex<Fallback> = std::sync::Mutex::new(Fallback { p
 
 /// Whether to ask the write watch of the marked heap this frame.
 pub(crate) fn ask_due(frame: u64) -> bool {
+    if whole() { return true; }
     let mut f = FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
     if check_budget() == 0 || f.asked != 0 && frame < f.asked + check_every() {
         return false;
@@ -275,6 +289,11 @@ pub(crate) fn asked(ranges: &[(usize, usize)]) {
 /// The pages to look at whole this frame (once a frame; none after).
 pub(crate) fn to_check(frame: u64) -> Vec<usize> {
     let mut f = FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
+    if whole() {
+        let out: Vec<usize> = std::mem::take(&mut f.pages).into_iter().collect();
+        CHECKED[0].fetch_add(out.len() as u64, Relaxed);
+        return out;
+    }
     if f.looked == frame {
         return Vec::new();
     }
@@ -586,6 +605,15 @@ pub(crate) fn line(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_budget_accepts_all_without_changing_default() {
+        assert_eq!(budget_of(None), 16);
+        assert_eq!(budget_of(Some("all")), usize::MAX);
+        assert_eq!(budget_of(Some("32")), 32);
+        assert_eq!(budget_of(Some("0")), 0);
+        assert_eq!(budget_of(Some("x")), 16);
+    }
 
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

@@ -14,6 +14,10 @@
 //! once); unset, the title's interval as before. The loader gives the title
 //! the matching frame rate too (`victory_loader::frame_rate`), as the title
 //! would otherwise keep to its 30 with a limiter of its own.
+//!
+//! `VICTORY_PRECISE_PACING=1` retains the phase on identical interval
+//! requests and uses a short bounded spin after the scheduler sleep for
+//! successful event waits. Timeout polls retain their original behavior.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Mutex;
@@ -53,11 +57,67 @@ fn parse_ms(spec: &str) -> Option<Duration> {
     Some(Duration::from_nanos((ms * 1e6).round() as u64))
 }
 
+/// Sprint 7 is independently reversible. No change to the title's rate,
+/// token ordering, timeout result, or late-wait policy.
+fn precise_pacing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PRECISE_PACING").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("precise frame pacing enabled (VICTORY_PRECISE_PACING=1; spin at most 300 us per event)");
+        }
+        on
+    })
+}
+
+const SPIN_TAIL: Duration = Duration::from_micros(300);
+
+/// A successful timed event must not be released ahead of its deadline.
+/// Avoid busy waiting for the bulk of the interval; no spin on timeouts.
+/// A late scheduler wake simply returns without spinning.
+fn sleep_event(wait: Duration, precise: bool) {
+    if wait.is_zero() {
+        return;
+    }
+    if !precise {
+        std::thread::sleep(wait);
+        return;
+    }
+    let start = Instant::now();
+    let coarse = wait.saturating_sub(SPIN_TAIL);
+    if !coarse.is_zero() {
+        std::thread::sleep(coarse);
+    }
+    // Recheck elapsed time. If the coarse sleep returned earlier than
+    // requested, sleep again instead of extending the spin budget.
+    let remaining = wait.saturating_sub(start.elapsed());
+    if remaining > SPIN_TAIL {
+        std::thread::sleep(remaining.saturating_sub(SPIN_TAIL));
+    }
+    let spin_start = Instant::now();
+    while start.elapsed() < wait && spin_start.elapsed() < SPIN_TAIL {
+        std::hint::spin_loop();
+    }
+    let remaining = wait.saturating_sub(start.elapsed());
+    if !remaining.is_zero() {
+        std::thread::sleep(remaining);
+    }
+}
+
 struct Clock {
     start: Instant,
     interval: Duration,
     /// The tick number at `start` (ticks go on across interval changes).
     first: u64,
+}
+
+/// Repeated setting of the same interval must not restart the clock when
+/// phase preservation is enabled. Genuine rate changes still restart it.
+fn update_clock(slot: &mut Option<Clock>, interval: Duration, first: u64, now: Instant, preserve: bool) {
+    if preserve && slot.as_ref().is_some_and(|c| c.interval == interval) {
+        return;
+    }
+    *slot = Some(Clock { start: now, interval, first });
 }
 
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
@@ -89,11 +149,7 @@ pub(crate) extern "system" fn set_interval(
         .map(|t| t.load(Ordering::Relaxed))
         .max()
         .unwrap_or(0);
-    *clock() = Some(Clock {
-        start: Instant::now(),
-        interval,
-        first,
-    });
+    update_clock(&mut *clock(), interval, first, Instant::now(), precise_pacing());
     S_OK
 }
 
@@ -183,13 +239,14 @@ pub(crate) extern "system" fn wait(
         wait = Duration::ZERO;
     }
     let _called = crate::timeline::span("the title's frame wait");
+    let precise = precise_pacing();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let wait_started = Instant::now();
     let hr = if wait > limit {
         std::thread::sleep(limit);
         TIMEOUT
     } else {
-        if !wait.is_zero() {
-            std::thread::sleep(wait);
-        }
+        sleep_event(wait, precise);
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
@@ -197,7 +254,10 @@ pub(crate) extern "system" fn wait(
     {
         use crate::copystat::{C, add};
         add(C::PaceWaits, 1);
-        add(C::PaceUs, wait.min(limit).as_micros() as u64);
+        // In Sprint 7 report observed wait time, not just the requested
+        // duration. This exposes scheduler oversleep in the existing log.
+        let elapsed = if precise { wait_started.elapsed() } else { wait.min(limit) };
+        add(C::PaceUs, elapsed.as_micros() as u64);
     }
     // A frame begun on a time-out takes no tick: its flip still does.
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
@@ -316,6 +376,34 @@ pub(crate) extern "system" fn statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identical_interval_keeps_phase_but_rate_change_restarts() {
+        let now = Instant::now();
+        let later = now + Duration::from_millis(5);
+        let mut slot = None;
+        update_clock(&mut slot, SIXTIETH, 10, now, true);
+        update_clock(&mut slot, SIXTIETH, 12, later, true);
+        let c = slot.as_ref().unwrap();
+        assert_eq!(c.start, now);
+        assert_eq!(c.first, 10);
+        let slower = Duration::from_millis(33);
+        update_clock(&mut slot, slower, 12, later, true);
+        let c = slot.as_ref().unwrap();
+        assert_eq!(c.start, later);
+        assert_eq!(c.first, 12);
+        assert_eq!(c.interval, slower);
+        update_clock(&mut slot, slower, 14, later, false);
+        assert_eq!(slot.unwrap().first, 14);
+    }
+
+    #[test]
+    fn precise_wait_does_not_finish_early() {
+        let wait = Duration::from_millis(2);
+        let start = Instant::now();
+        sleep_event(wait, true);
+        assert!(start.elapsed() >= wait);
+    }
 
     #[test]
     fn the_switch_reads_milliseconds() {
