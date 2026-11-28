@@ -56,12 +56,13 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
-// Explicit 0/1 overrides the builder-dependent default.
-fn rt_pass_enabled(builder: bool, value: Option<&str>) -> bool {
+// Match Belobug's eligibility: these title passes are allowed even when
+// the BVH builder is disabled. Explicit 0 still isolates either pass.
+fn rt_pass_enabled(value: Option<&str>) -> bool {
     match value {
         Some("0") => false,
         Some("1") => true,
-        _ => builder,
+        _ => true,
     }
 }
 
@@ -69,8 +70,8 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     static SWITCHES: OnceLock<(bool, bool)> = OnceLock::new();
     let &(rt, activate) = SWITCHES.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        let rt = rt_pass_enabled(builder, std::env::var("VICTORY_RT_RESOLVE").ok().as_deref());
-        let activate = rt_pass_enabled(builder, std::env::var("VICTORY_ACTIVATE_RAYS").ok().as_deref());
+        let rt = rt_pass_enabled(std::env::var("VICTORY_RT_RESOLVE").ok().as_deref());
+        let activate = rt_pass_enabled(std::env::var("VICTORY_ACTIVATE_RAYS").ok().as_deref());
         tracing::info!(builder_requested = builder, rt_resolve = rt, activate_rays = activate,
             "ray-tracing pass selection");
         (rt, activate)
@@ -154,6 +155,9 @@ impl Pending {
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(reason) = p.left_out {
+        return Some(reason.into());
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
@@ -560,12 +564,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ray_pass_switches_preserve_defaults_and_allow_explicit_overrides() {
-        for builder in [false, true] {
-            assert_eq!(rt_pass_enabled(builder, None), builder);
-            assert!(rt_pass_enabled(builder, Some("1")));
-            assert!(!rt_pass_enabled(builder, Some("0")));
-        }
+    fn lighting_passes_default_on_without_requiring_the_builder() {
+        assert!(rt_pass_enabled(None));
+        assert!(rt_pass_enabled(Some("1")));
+        assert!(!rt_pass_enabled(Some("0")));
     }
 
     #[test]
