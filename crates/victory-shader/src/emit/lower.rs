@@ -24,6 +24,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+mod lanes;
 
 type Why = &'static str;
 
@@ -414,7 +415,9 @@ enum MaskData {
     /// size. Only uses that mean the same on any wave are allowed: counts,
     /// the first lane, the count below a lane, equality (the HLSL wave
     /// operations the console compiler expands). Lane numbers stay host
-    /// lanes throughout (`v_mbcnt`, `v_readlane` at a computed lane).
+    /// lanes throughout (`v_mbcnt`, `v_readlane` at a computed lane),
+    /// except for wave32 programs where each half of a wide host wave
+    /// uses its own mask dword and half-local lane numbering.
     Host,
     /// Mesh programs: their lanes and waves (LDS per console wave) are the
     /// console's but no host wave size can be declared.
@@ -4099,7 +4102,11 @@ impl<'a> Lower<'a> {
                 xy
             }
         };
-        Ok(if high { y } else { x })
+        Ok(match self.host_half() {
+            Some(upper) if !high => self.s.m.select(self.cur, upper, y, x),
+            _ if high => y,
+            _ => x,
+        })
     }
 
     // ---- operands ----
@@ -9376,11 +9383,13 @@ impl<'a> Lower<'a> {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
-                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                let lane = if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
                     self.s.flags |= flags::WAVE_OPS;
+                    self.host_lane(lane)
                 } else {
                     self.cross_lane(false)?;
-                }
+                    lane
+                };
                 if let Some(slot) = self.exchange.as_ref().map(|e| e.0) {
                     if self.local && self.local_any {
                         // this host wave's lane of that number (lanes 32..63 are 0..31 here)
@@ -10847,7 +10856,11 @@ impl<'a> Lower<'a> {
                 } else if self.s.mesh.is_none() {
                     self.cross_lane(false)?;
                 }
-                let lane = self.console_lane();
+                let mut lane = self.console_lane();
+                if self.mask_data == MaskData::Host && !self.x.native.wave64 {
+                    let k31 = k(self, 31);
+                    lane = self.s.m.bin(c, Bin::And, lane, k31);
+                }
                 let below = if name == "v_mbcnt_lo_u32_b32" {
                     lane
                 } else {
