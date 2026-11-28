@@ -1228,11 +1228,13 @@ fn view_elements(view: &View) -> Option<(u32, bool, u32)> {
 /// the title puts parameter blocks at ring positions: a raw view of 128 bytes
 /// at 8 (the colour table bakes'), structured ones of elements that are no
 /// divisor of their place (the culling's 456-byte constants). Such a view gets
-/// a copy of its own bytes ([`crate::shadow::exact`]). (A typed view of
-/// 12-byte elements at a multiple of 16 that is none of 12 is one of them: it
-/// was passed over, and stayed null.)
-fn off_elements(offset: u64, stride: u32, raw: bool, element: u64) -> bool {
-    if raw {
+/// a copy of its own bytes ([`crate::shadow::exact`]). With no raw twin,
+/// an untyped structured view also needs that copy to be 16-byte aligned.
+/// A typed view of 12-byte elements also needs its own copy when its start
+/// is a multiple of 16 but not a multiple of 12.
+fn off_elements(offset: u64, stride: u32, raw: bool, element: u64, has_raw_twins: bool) -> bool {
+    let needs_raw = stride > 0 && stride.is_multiple_of(4) && !has_raw_twins;
+    if raw || needs_raw {
         !offset.is_multiple_of(16)
     } else if stride > 0 {
         !offset.is_multiple_of(16) && !offset.is_multiple_of(u64::from(stride))
@@ -1269,7 +1271,13 @@ fn view_home(
         return shadow;
     }
     let element = crate::resource::element(format).map_or(0, |(bytes, _)| bytes);
-    if !off_elements(offset, stride, raw, element) {
+    // Pick the same copy when creating the descriptor and when refreshing it,
+    // even if the latter lookup comes before the title creates its view heap.
+    if stride > 0 {
+        probe_view_limit();
+    }
+    let has_raw_twins = victory_shader::emit::raw_views() != 0;
+    if !off_elements(offset, stride, raw, element, has_raw_twins) {
         return shadow;
     }
     crate::shadow::exact(start, len).unwrap_or(shadow)
@@ -1525,17 +1533,30 @@ impl HostHeap {
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
+        // Sampler heaps always back the full 2,048 hardware limit and reserve
+        // slot 2,047 as a permanent null point sampler so `umin(index, 2047)`
+        // in `victory-shader` never reads past smaller title sampler heaps.
+        const SAMPLERS: u32 = 2048;
         if !sampler {
             probe_view_limit();
         }
         let null = if sampler {
-            0
+            SAMPLERS - 1
         } else {
             victory_shader::emit::view_heap_limit()
         };
         let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
         let extra = if sampler { 0 } else { dynamic_slots(count, null) };
-        let (heap, count, size) = if null == 0 {
+        let (heap, count, size) = if sampler {
+            let fitted = count.min(SAMPLERS - 1);
+            match make(SAMPLERS) {
+                Ok(heap) => (heap, fitted, SAMPLERS),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
+            }
+        } else if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
                 Err(e) => {
@@ -5008,6 +5029,21 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    /// Every host sampler heap backs all 2,048 hardware descriptors and
+    /// reserves slot 2,047 as a null sentinel so `umin(index, 2047)` in
+    /// `victory-shader` never reads past smaller title sampler heaps.
+    #[test]
+    fn sampler_heaps_back_2048_slots_and_reserve_null_sentinel() {
+        let Some(small) = HostHeap::new(true, 16) else { return };
+        // SAFETY: live heap query.
+        assert_eq!(unsafe { small.heap.GetDesc().NumDescriptors }, 2048);
+        assert_eq!(small.count, 16);
+        let Some(full) = HostHeap::new(true, 2048) else { return };
+        // SAFETY: live heap query.
+        assert_eq!(unsafe { full.heap.GetDesc().NumDescriptors }, 2048);
+        assert_eq!(full.count, 2047);
+    }
+
     /// A view of a host copy that begins at a later level shows the same
     /// levels of it.
     #[test]
@@ -5401,18 +5437,22 @@ mod tests {
     #[test]
     fn views_off_their_elements_are_told() {
         // the colour table bakes' parameter block: raw, 8 bytes into its window
-        assert!(off_elements(8, 0, true, 4));
-        assert!(!off_elements(0, 0, true, 4));
-        assert!(!off_elements(48, 0, true, 4));
+        assert!(off_elements(8, 0, true, 4, true));
+        assert!(!off_elements(0, 0, true, 4, true));
+        assert!(!off_elements(48, 0, true, 4, true));
         // 456-byte elements: at one of them, on 16 bytes, at neither
-        assert!(!off_elements(456, 456, false, 0));
-        assert!(!off_elements(32, 456, false, 0));
-        assert!(off_elements(100, 456, false, 0));
+        assert!(!off_elements(456, 456, false, 0, true));
+        assert!(!off_elements(32, 456, false, 0, true));
+        assert!(off_elements(100, 456, false, 0, true));
         // A typed view of 12-byte elements on 16 bytes and not on an element.
-        assert!(off_elements(23_702_896, 0, false, 12));
-        assert!(!off_elements(48, 0, false, 12));
-        assert!(!off_elements(12, 0, false, 4));
-        assert!(off_elements(12, 0, false, 8));
+        assert!(off_elements(23_702_896, 0, false, 12, true));
+        assert!(!off_elements(48, 0, false, 12, true));
+        assert!(!off_elements(12, 0, false, 4, true));
+        assert!(off_elements(12, 0, false, 8, true));
+        // With no raw twin, a structured view is read as raw at its own slot.
+        assert!(off_elements(56, 56, false, 0, false));
+        assert!(!off_elements(56, 56, false, 0, true));
+        assert!(!off_elements(112, 56, false, 0, false));
     }
 
     /// Such a view is made on a copy of its own bytes, and that copy is the one
@@ -5459,6 +5499,27 @@ mod tests {
             assert_eq!(width(&v), len.next_multiple_of(256));
             let (copy, address, bytes) = buffer_copy(&v).unwrap();
             assert_eq!((copy.span(), address, bytes), ((start + off, len), start + off, len));
+        }
+        // Register the backing range so the host copy starts at `start`,
+        // independent of the loose memory window that contains the allocation.
+        let mut v = view(start, false);
+        let View::Placed(_, _, desc) = &mut v else { unreachable!() };
+        desc[4] = 1; // FirstElement, at byte offset 456 in the copy
+        desc[6] = 3; // NumElements
+        let key = start as usize;
+        crate::shadow::register(key, start, 4 * 456);
+        let made = make(&v, at);
+        let refreshed = buffer_copy(&v);
+        crate::shadow::unregister(key, start);
+        let made = made.expect("a view").expect("a buffer");
+        let (copy, address, bytes) = refreshed.unwrap();
+        assert_eq!((address, bytes), (start + 456, 3 * 456));
+        assert_eq!(made, copy.buffer, "the descriptor and refresh share a copy");
+        if victory_shader::emit::raw_views() == 0 {
+            assert_eq!(copy.span(), (address, bytes));
+            eprintln!("the structured slot without a raw twin uses a view-relative copy");
+        } else {
+            assert_eq!(copy.span(), (start, 4 * 456));
         }
         for (off, raw) in [(16, true), (32, false)] {
             let v = view(start + off, raw);
