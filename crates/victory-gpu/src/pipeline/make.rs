@@ -67,8 +67,9 @@ fn excluded_pass(stage: &str, container: &[u8], skip_rt: bool, skip_activate: bo
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     static SWITCHES: OnceLock<(bool, bool)> = OnceLock::new();
     let &(skip_rt, skip_activate) = SWITCHES.get_or_init(|| {
-        let rt = std::env::var_os("VICTORY_RT_RESOLVE").is_some_and(|v| v == "0");
-        let activate = std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
+        let replacement = crate::ambient::screen_space();
+        let rt = std::env::var_os("VICTORY_RT_RESOLVE").map_or(replacement, |v| v == "0");
+        let activate = std::env::var_os("VICTORY_ACTIVATE_RAYS").map_or(replacement, |v| v == "0");
         tracing::info!(rt_resolve = !rt, activate_rays = !activate, "lighting pipeline A/B switches");
         (rt, activate)
     });

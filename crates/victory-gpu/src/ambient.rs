@@ -23,6 +23,12 @@
 //! mean of the last seconds, so that turning into a dark corner is not black
 //! at once). No occlusion but the creases'.
 //!
+//! Experimental `VICTORY_LIGHTING_MODE=screen_space` replaces the packed
+//! diffuse resolve output with a bounded estimate from cached screen-space
+//! radiance and depth. It never samples the title's traced diffuse result.
+//! It is not DXR, and cannot recover off-screen geometry or reflections.
+//! The default `original` preserves the existing behavior.
+//!
 //! `VICTORY_AMBIENT`:
 //! - unset or `0`/`off`: the title's own output.
 //! - a number: that share of the estimate (1: all of it).
@@ -92,7 +98,25 @@ fn parse(set: &str) -> Set {
     }
 }
 
+fn replacement_mode(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("screen_space")
+}
+
+pub(crate) fn screen_space() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| replacement_mode(&std::env::var("VICTORY_LIGHTING_MODE").unwrap_or_default()))
+}
+
 fn set() -> Set {
+    if screen_space() {
+        static LEVEL: OnceLock<f32> = OnceLock::new();
+        return Set::Estimate(*LEVEL.get_or_init(|| {
+            std::env::var("VICTORY_SCREEN_GI_LEVEL").ok()
+                .and_then(|s| s.trim().parse::<f32>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(0.8).clamp(0.05, 4.0)
+        }));
+    }
     static SET: OnceLock<Set> = OnceLock::new();
     *SET.get_or_init(|| match parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()) {
         // With the band asked for and no share, the band's level.
@@ -135,7 +159,7 @@ fn parse_band(set: &str) -> Option<Band> {
 /// Whether the stand-in is on: set, and the title's rays find nothing (or
 /// the band is asked for with them).
 pub(crate) fn on() -> bool {
-    set() != Set::Off && (rt_band().is_some() || !crate::pipeline::builder_runs())
+    screen_space() || (set() != Set::Off && (rt_band().is_some() || !crate::pipeline::builder_runs()))
 }
 
 /// The title's leftover light is kept between these multiples of the
@@ -267,6 +291,9 @@ static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
 float3 seen(int2 p, float2 size) {
     float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
+#ifdef SCREEN_SPACE_REPLACEMENT
+    if (isnan(d) || isinf(d) || d <= 0.0) d = 1e-7;
+#endif
     float z = min(near / max(d, 1e-7), 1000.0);
     float2 ndc = (float2(p) + 0.5) / size * 2.0 - 1.0;
     return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
@@ -294,13 +321,18 @@ void keep(uint3 at : SV_DispatchThreadID) {
 void mean() {
     float3 sum = 0;
     for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
-    float4 was = cells[CELLS];
     float3 now = sum / CELLS;
+#ifdef SCREEN_SPACE_REPLACEMENT
+    // No read of uninitialized or stale temporal history in this mode.
+    cells[CELLS] = float4(now, 1.0);
+#else
+    float4 was = cells[CELLS];
     // Upstream: a sufficiently large light change is followed immediately.
     float a = max(dot(now, LUMA), 1e-5), b = max(dot(was.rgb, LUMA), 1e-5);
     bool jumped = jump > 0.0 && max(a / b, b / a) > jump;
     float age = was.a > 0.0 && !jumped ? was.a + dt : 0.001;
     cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, jumped ? 1.0 : follow) : now, age);
+#endif
 }
 #endif
 
@@ -323,12 +355,35 @@ void gather(uint3 at : SV_DispatchThreadID) {
     float r2 = 0.25 + 0.0025 * p.z * p.z;
     float whole = 0;
     float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
+#ifdef SCREEN_SPACE_REPLACEMENT
+    // 64 stratified broad samples plus 25 nearby cells. Keep the pattern
+    // deterministic to avoid introducing stochastic flicker.
+    int2 center = int2((float2(at.xy) + 0.5) * float2(CX, CY) / float2(PX, PY));
+    for (uint sample_id = 0; sample_id < 89; sample_id++) {
+        int2 q;
+        if (sample_id < 64) {
+            uint2 tile = uint2(sample_id % 8, sample_id / 8);
+            q = int2((float2(tile) + 0.5) * float2(CX, CY) / 8.0);
+        } else {
+            uint local_id = sample_id - 64;
+            q = center + int2(int(local_id % 5) - 2, int(local_id / 5) - 2);
+            if (any(q < 0) || any(q >= int2(CX, CY))) continue;
+        }
+        uint i = uint(q.y) * CX + uint(q.x);
+#else
     for (uint i = 0; i < CELLS; i++) {
+#endif
         float4 c = cells[CELLS + 1 + i];
         float3 L = cells[i].rgb;
         float3 d = c.xyz - p;
         float dd = dot(d, d);
         float w = c.w / (dd + r2);
+#ifdef SCREEN_SPACE_REPLACEMENT
+        // Suppress distant, unrelated surfaces and background depth.
+        float depth_delta = abs(c.z - p.z) / max(p.z, 0.1);
+        w *= (c.z < 999.0 ? 1.0 : 0.0) / (1.0 + 8.0 * depth_delta);
+        w *= sample_id < 64 ? 1.0 : 2.0;
+#endif
         float3 dir = d / sqrt(dd + 0.25 * r2);
         whole += w;
         toward += w * dir;
@@ -441,6 +496,12 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+#ifdef SCREEN_SPACE_REPLACEMENT
+    // Authoritative replacement. Do not blend with potentially invalid
+    // traced probe contents; sanitize before converting to RGB9E5.
+    if (any(isnan(found)) || any(isinf(found))) found = 0.0;
+    light[p] = pack(clamp(found, 0.0, 20.0));
+#else
     float3 was = unpack(light[p]);
     // Filter magenta garbage probes left by uninitialized/corrupted memory on AMD.
     if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
@@ -451,6 +512,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
     light[p] = pack(max(was, found * least));
+#endif
 }
 #endif
 "#;
@@ -479,7 +541,8 @@ unsafe impl Sync for Pass {}
 fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        let replacement = if screen_space() { "#define SCREEN_SPACE_REPLACEMENT\n" } else { "" };
+        let code = crate::host::compile(&format!("{replacement}#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
             if root.is_none() {
@@ -561,7 +624,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return false;
     }
-    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+    if role == Role::Air && (screen_space() || constant > 0.0 || air() == 0.0) {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -569,7 +632,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
         if *said < 4 {
             *said += 1;
-            tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
+            tracing::info!(?role, size = ?views.size, level, constant, replacement = screen_space(), "a stand-in for the indirect light");
         }
     }
     list.keep(&pass.cells);
@@ -629,6 +692,15 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_is_explicitly_opt_in() {
+        assert!(replacement_mode("screen_space"));
+        assert!(replacement_mode(" SCREEN_SPACE "));
+        assert!(!replacement_mode(""));
+        assert!(!replacement_mode("original"));
+        assert!(!replacement_mode("native_dxr"));
+    }
 
     #[test]
     fn settings() {
