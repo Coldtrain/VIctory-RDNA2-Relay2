@@ -538,10 +538,10 @@ unsafe impl Send for Pass {}
 // SAFETY: as above.
 unsafe impl Sync for Pass {}
 
-fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
+fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>, screen_space: bool) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let replacement = if screen_space() { "#define SCREEN_SPACE_REPLACEMENT\n" } else { "" };
+        let replacement = if screen_space { "#define SCREEN_SPACE_REPLACEMENT\n" } else { "" };
         let code = crate::host::compile(&format!("{replacement}#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
@@ -580,7 +580,7 @@ fn pass() -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let host = host()?;
-        make(&host.device, |bytes| host.uav_buffer(bytes))
+        make(&host.device, |bytes| host.uav_buffer(bytes), screen_space())
             .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for the indirect light"))
             .ok()
     })
@@ -736,6 +736,9 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+        for replacement in [false, true] {
+            make(&host.device, |bytes| host.uav_buffer(bytes), replacement)
+                .expect("the passes in both lighting modes");
+        }
     }
 }
