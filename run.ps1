@@ -1,13 +1,14 @@
 # Sprint 6 + Belobug rendering fixes. Run from the repo root.
 # Example: .\run.ps1 -Exe 'F:\Games\GTAVI\game_scarlett_master.exe' -FsrDll 'F:\Games\FSR\amd_fidelityfx_dx12.dll'
 param(
-    [Parameter(Mandatory)][string]$Exe,
-    [Parameter(Mandatory)][string]$FsrDll,
+    [string]$Exe = 'F:\Games\GTAVI\game_scarlett_master.exe',
+    [string]$FsrDll = 'F:\Games\FSR\amd_fidelityfx_dx12.dll',
     [ValidateRange(0,1)][int]$RTResolve = 1,
     [ValidateRange(0,1)][int]$ActivateRays = 1,
     [ValidateRange(0,1)][int]$BvhBuilder = 0,
     [ValidateRange(0,4)][double]$Ambient = 0.8,
     [ValidateRange(0,2147483647)][int]$DescriptorPages = 64,
+    [switch]$PerformancePorts,
     [hashtable]$More = @{},
     [switch]$SkipBuild
 )
@@ -33,6 +34,7 @@ try {
         VICTORY_PORT_AMD_TEXTURE_BUDGET='1'
         VICTORY_TEXTURE_MAX='0'
         VICTORY_PORT_CONSTANTS='1'
+        VICTORY_SEND_CHANGED='0'
         VICTORY_PORT_DESCRIPTORS='1'
         VICTORY_PORT_DESCRIPTORS_CHECK=[string]$DescriptorPages
         VICTORY_PORT_DESCRIPTORS_EVERY='1'
@@ -75,6 +77,20 @@ try {
     # VICTORY_PORT_JOURNAL, VICTORY_TEXTURE_PRELUDE, VICTORY_AMBIENT_SETTLE,
     # VICTORY_AMBIENT_RT, VICTORY_LIGHTING_MODE, VICTORY_SCREEN_GI_LEVEL.
     # This branch parses the descriptor fallback budget as a number, not 'all'.
+    # The supplied Belobug scripts/play.ps1 does not turn on renderer
+    # ports 1/2/5/6/7. Match its default geometry-memory path first,
+    # leaving our FSR/Series S configuration intact. PerformancePorts
+    # reproduces the earlier Sprint 6 optimization configuration.
+    if (-not $PerformancePorts) {
+        foreach ($name in @('VICTORY_PORT_CONSTANTS','VICTORY_PORT_DESCRIPTORS',
+            'VICTORY_PORT_CBV','VICTORY_PORT_CBV_PLACE','VICTORY_PORT_CBV_RELAY2',
+            'VICTORY_PORT_GUARD','VICTORY_PORT_GUARD_PLAN','VICTORY_PORT_JOURNAL')) {
+            $settings[$name] = '0'
+        }
+        Write-Host 'Belobug default geometry-memory path (renderer ports off; FSR retained)'
+    } else {
+        Write-Host 'Sprint 6 performance ports enabled'
+    }
     foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
     $log = ".\logs\fsr-framegen-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
     .\scripts\play.ps1 -Exe $Exe -Console series-s -RenderScale 0.3 -Upscaler amd -More $settings 2>&1 | Tee-Object -FilePath $log
