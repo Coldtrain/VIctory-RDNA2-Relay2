@@ -4,25 +4,48 @@ An independent source-snapshot fork of the CoolFox Relay 2 build, with bounded D
 
 ## Gameplay results — November 27, 2026
 
-**AMD Radeon RX 6800 (RDNA 2): ~17–18 rendered FPS / ~35 presented FPS with native AMD FSR 3.1 Super Resolution and Frame Generation.** No DLSS or driver AFMF is needed.
+**RX 6800: 24.1 rendered FPS / 48.0 presented FPS on average, with peaks of 34.8 rendered / 70.7 presented FPS.** Native AMD FSR 3.1 Super Resolution + Frame Generation, Series S, 1080p output at 30% internal scale (576 × 324).
 
-| Configuration | Native/rendered FPS | Presented FPS (including FG) |
+| Tested configuration | Native/rendered FPS | Presented FPS (including FG) |
 | --- | ---: | ---: |
-| Series S, 960 × 540 internal → 1920 × 1080, native FSR 3.1 SR + FG | **17.4** | **34.7** |
-| Same session, upper-end sampled performance | 29.1 | 59.2 |
+| Sprint 6 — mean (259 positive ON samples) | **24.10** | **47.99** |
+| Sprint 6 — median | 23.61 | 46.71 |
+| Sprint 6 — peak sampled | 34.84 | 70.68 |
+| Earlier FSR baseline (`b752c46`, 50% scale) — mean | 17.4 | 34.7 |
 
-The averages above are arithmetic means of 959 logged presentation-meter samples with frame generation active, from Coldtrain's November 27 test of commit `b752c46`. The session lasted approximately 17 minutes 48 seconds and ended by closing the window rather than crashing. The upper-end values are individual sampled maxima, not sustained performance. The DXGI presentation meter estimates presented FPS, not physical display scanout; generated frames do not increase the game's simulation or native rendering rate. Results depend on scene, streaming and shader cache state. No universal performance or crash-free guarantee is implied.
+The Sprint 6 session lasted about 5 min 54 s and ended on window close, without recorded GPU device removal. 44 of the 259 sampled windows reached at least 60 presented FPS. Peaks are not sustained performance; presented FPS includes generated frames and is not physical scanout. Different internal resolutions and scenes prevent a controlled comparison with the older run.
 
-### Reproduce the native AMD test
+See the [full Sprint 6 benchmark report](docs/sprint6-rx6800-benchmark.md) for methodology, hardware, limitations and the transition-inclusive results. [Optimization history](docs/belobug-optimizations.md) describes the six cumulative ports.
 
-Supply the Windows AMD FidelityFX SDK 1.1.4 DLL (`amd_fidelityfx_dx12.dll`); it is not bundled. See [AMD FSR integration and limitations](docs/amd-fsr-framegen.md).
+### Reproduce the Sprint 6 configuration
+
+Supply the Windows AMD FidelityFX SDK 1.1.4 DLL (`amd_fidelityfx_dx12.dll`); it is not bundled. See [AMD FSR integration and limitations](docs/amd-fsr-framegen.md). The following is a recommended Sprint 6 configuration, not a byte-for-byte record of all environment overrides in the test.
 
 ```powershell
 cargo build --locked --profile diag -p victory --features diagnostics
-.\scripts\play.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe' -Console series-s -RenderScale 0.50 -Upscaler amd -More @{
+.\scripts\play.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe' -Console series-s -RenderScale 0.30 -Upscaler amd -More @{
     VICTORY_FSR_FRAMEGEN='1'
     VICTORY_FSR_SDK_DLL='D:\SDK\amd_fidelityfx_dx12.dll'
     VICTORY_AFMF='0'
+    VICTORY_FRAME_INTERVAL_MS='16.667'
+    VICTORY_TITLE_FPS='60'
+    VICTORY_PORT_CONSTANTS='1'
+    VICTORY_PORT_DESCRIPTORS='1'
+    VICTORY_PORT_DESCRIPTORS_CHECK='64'
+    VICTORY_PORT_DESCRIPTORS_EVERY='1'
+    VICTORY_PORT_CBV='1'
+    VICTORY_PORT_CBV_PLACE='1'
+    VICTORY_PORT_CBV_RELAY2='1'
+    VICTORY_PORT_GUARD='1'
+    VICTORY_PORT_GUARD_PLAN='1'
+    VICTORY_PORT_AMD_TEXTURE_BUDGET='1'
+    VICTORY_TEXTURE_MAX='0'
+    VICTORY_LIST_POOL='1'
+    VICTORY_SUBMIT_DEPTH='32'
+    VICTORY_ASYNC_SUBMIT='1'
+    VICTORY_THIN_THREADS='8'
+    VICTORY_UPLOAD_WORKERS='8'
+    VICTORY_BVH_BUILDER='0'
 }
 ```
 
@@ -63,12 +86,7 @@ cargo build --locked --profile diag -p victory --features diagnostics
 
 ### Graphics-only regression test
 
-This branch starts directly from the original RDNA2 Relay2 main commit. It adds
-launcher controls and the existing build-checked resolution hooks from
-`perf/belobug-06a-render-scale` / `perf/belobug-06b-upscaler-choice`.
-No renderer, shader translator, allocator, relay, descriptor, texture or
-pipeline implementation is changed. Series S uses the baseline's existing
-console profile and two-plane presenter.
+Historical graphics-only testing instructions below apply to the earlier baseline, not the current Sprint 6 renderer. Use the stock settings to compare console profiles; main now includes the six performance ports and native AMD FSR.
 
 ```powershell
 .\scripts\play.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe' -Console series-x -Upscaler stock
